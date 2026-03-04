@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Buildings → STL (Map2Model-style)</title>
+
+  <!-- MapLibre -->
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.12.0/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@^5.12.0/dist/maplibre-gl.js"></script>
+
+  <!-- Three.js (ESM) via importmap -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.161.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.161.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <!-- Earcut for polygon triangulation -->
+  <script src="https://unpkg.com/earcut@2.2.4/dist/earcut.min.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #app { height: 100%; display: grid; grid-template-columns: 360px 1fr; }
+    #panel { padding: 14px; border-right: 1px solid #e6e6e6; }
+    #map { height: 100%; }
+    .btn { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #111; background:#111; color:#fff; font-weight:700; cursor:pointer;}
+    .btn.secondary { background:#fff; color:#111; }
+    .btn:disabled { opacity:.5; cursor:not-allowed; }
+    .card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 12px; margin-top: 12px; }
+    .small { color:#555; font-size: 12px; line-height: 1.4; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+    .row { display:flex; gap:10px; margin-top:10px; }
+    .row > * { flex: 1; }
+    .warn { color:#8a4b00; }
+  </style>
+</head>
+
+<body>
+<div id="app">
+  <div id="panel">
+    <h2 style="margin:0 0 8px 0;">Buildings → STL</h2>
+    <div class="small">
+      Drag a rectangle on the map, then generate an STL of building extrusions inside that area.
+      <div class="warn" style="margin-top:8px;">
+        Keep the selection small (a few city blocks) for the first test.
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800;">Selection</div>
+      <div id="status" class="small" style="margin-top:8px;">No selection yet.</div>
+      <div class="small" style="margin-top:8px;">Bounds (W,S,E,N):</div>
+      <div id="bounds" class="mono" style="margin-top:6px;">—</div>
+
+      <div class="row">
+        <button id="clearBtn" class="btn secondary" disabled>Clear</button>
+        <button id="genBtn" class="btn" disabled>Generate STL</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800;">Model settings (simple MVP)</div>
+      <div class="small" style="margin-top:8px;">
+        Base thickness: <span class="mono">2 mm</span><br/>
+        Default building height: <span class="mono">12 m</span><br/>
+        Height from OSM: <span class="mono">height</span> or <span class="mono">building:levels × 3m</span><br/>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800;">Attribution</div>
+      <div class="small" style="margin-top:8px;">
+        Buildings data: OpenStreetMap contributors. Please include attribution if you publish outputs.
+      </div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+</div>
+
+<script type="module">
+  import * as THREE from "three";
+  import { STLExporter } from "three/addons/exporters/STLExporter.js"; // STLExporter docs :contentReference[oaicite:2]{index=2}
+
+  // ---------- Map ----------
+  const map = new maplibregl.Map({
+    container: "map",
+    style: "https://demotiles.maplibre.org/style.json",
+    center: [-73.9857, 40.7484],
+    zoom: 14
+  });
+  map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  // ---------- UI state ----------
+  let isDragging = false;
+  let startLngLat = null;
+  let currentBounds = null; // {w,s,e,n}
+
+  const statusEl = document.getElementById("status");
+  const boundsEl = document.getElementById("bounds");
+  const clearBtn = document.getElementById("clearBtn");
+  const genBtn = document.getElementById("genBtn");
+
+  function setButtons(hasSelection) {
+    clearBtn.disabled = !hasSelection;
+    genBtn.disabled = !hasSelection;
+  }
+
+  function rectToFeature(w, s, e, n) {
+    return {
+      type: "Feature",
+      geometry: {
+        type: "Polygon",
+        coordinates: [[[w,s],[e,s],[e,n],[w,n],[w,s]]]
+      },
+      properties: {}
+    };
+  }
+
+  function ensureSelectionLayer() {
+    if (map.getSource("selection")) return;
+    map.addSource("selection", { type: "geojson", data: { type:"FeatureCollection", features: [] }});
+    map.addLayer({ id:"selection-fill", type:"fill", source:"selection", paint:{ "fill-opacity": 0.15 }});
+    map.addLayer({ id:"selection-line", type:"line", source:"selection", paint:{ "line-width": 3 }});
+  }
+
+  function updateSelection(bounds) {
+    currentBounds = bounds;
+    const { w, s, e, n } = bounds;
+    boundsEl.textContent = `${w.toFixed(6)}, ${s.toFixed(6)}, ${e.toFixed(6)}, ${n.toFixed(6)}`;
+    statusEl.textContent = "Selection ready.";
+    setButtons(true);
+
+    ensureSelectionLayer();
+    map.getSource("selection").setData({
+      type:"FeatureCollection",
+      features:[rectToFeature(w,s,e,n)]
+    });
+  }
+
+  map.on("load", () => {
+    ensureSelectionLayer();
+    setButtons(false);
+  });
+
+  map.on("mousedown", (e) => {
+    if (e.originalEvent.button !== 0) return;
+    isDragging = true;
+    startLngLat = e.lngLat;
+    map.dragPan.disable();
+    statusEl.textContent = "Selecting…";
+  });
+
+  map.on("mousemove", (e) => {
+    if (!isDragging || !startLngLat) return;
+    const a = startLngLat;
+    const b = e.lngLat;
+    const w = Math.min(a.lng, b.lng);
+    const ee = Math.max(a.lng, b.lng);
+    const s = Math.min(a.lat, b.lat);
+    const n = Math.max(a.lat, b.lat);
+
+    ensureSelectionLayer();
+    map.getSource("selection").setData({
+      type:"FeatureCollection",
+      features:[rectToFeature(w,s,ee,n)]
+    });
+
+    boundsEl.textContent = `${w.toFixed(6)}, ${s.toFixed(6)}, ${ee.toFixed(6)}, ${n.toFixed(6)}`;
+    currentBounds = { w, s, e: ee, n };
+    setButtons(true);
+  });
+
+  function finishDrag() {
+    if (!isDragging) return;
+    isDragging = false;
+    startLngLat = null;
+    map.dragPan.enable();
+    if (currentBounds) statusEl.textContent = "Selection ready.";
+  }
+  map.on("mouseup", finishDrag);
+  map.on("mouseout", finishDrag);
+
+  clearBtn.addEventListener("click", () => {
+    currentBounds = null;
+    statusEl.textContent = "No selection yet.";
+    boundsEl.textContent = "—";
+    setButtons(false);
+    ensureSelectionLayer();
+    map.getSource("selection").setData({ type:"FeatureCollection", features:[] });
+  });
+
+  // ---------- Buildings via Overpass ----------
+  // We fetch OSM building ways + relations inside the bounding box.
+  function overpassQueryForBuildings({w,s,e,n}) {
+    // Overpass bbox is: (south,west,north,east)
+    return `
+      [out:json][timeout:25];
+      (
+        way["building"](${s},${w},${n},${e});
+        relation["building"](${s},${w},${n},${e});
+      );
+      out body;
+      >;
+      out skel qt;
+    `.trim();
+  }
+
+  async function fetchBuildingsOSM(bounds) {
+    const query = overpassQueryForBuildings(bounds);
+    // Public Overpass endpoints vary; this one is commonly used for demos.
+    // If it fails, you can swap endpoint later.
+    const endpoint = "https://overpass-api.de/api/interpreter";
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+      body: "data=" + encodeURIComponent(query)
+    });
+    if (!res.ok) throw new Error(`Overpass failed: HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  function osmToPolygons(osmJson) {
+    // Build node map
+    const nodes = new Map();
+    const ways = [];
+    const relations = [];
+
+    for (const el of osmJson.elements) {
+      if (el.type === "node") nodes.set(el.id, [el.lon, el.lat]);
+      else if (el.type === "way") ways.push(el);
+      else if (el.type === "relation") relations.push(el);
+    }
+
+    // Convert ways to rings (simple: only closed ways)
+    const polys = [];
+
+    for (const w of ways) {
+      if (!w.tags || !w.tags.building) continue;
+      if (!w.nodes || w.nodes.length < 4) continue;
+      if (w.nodes[0] !== w.nodes[w.nodes.length - 1]) continue;
+
+      const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+      if (ring.length >= 4) {
+        polys.push({
+          rings: [ring],
+          tags: w.tags
+        });
+      }
+    }
+
+    // NOTE: Relations (multipolygons) are ignored in this MVP for simplicity.
+    // We can add them next once MVP works.
+
+    return polys;
+  }
+
+  function parseHeightMeters(tags) {
+    // Prefer explicit height in meters if present.
+    // OSM height can be like "12", "12.5", or "12 m"
+    const DEFAULT_H = 12;
+
+    if (tags) {
+      if (tags.height) {
+        const m = String(tags.height).match(/([\d.]+)/);
+        if (m) return Math.max(3, parseFloat(m[1]));
+      }
+      if (tags["building:levels"]) {
+        const lvl = parseFloat(tags["building:levels"]);
+        if (Number.isFinite(lvl)) return Math.max(3, lvl * 3.0);
+      }
+    }
+    return DEFAULT_H;
+  }
+
+  // ---------- Geometry: lon/lat -> local meters ----------
+  function projectToLocalMeters(lon, lat, originLon, originLat) {
+    // Equirectangular approximation around origin (good for small areas)
+    const R = 6378137; // meters
+    const dLon = (lon - originLon) * Math.PI / 180;
+    const dLat = (lat - originLat) * Math.PI / 180;
+    const x = R * dLon * Math.cos(originLat * Math.PI / 180);
+    const y = R * dLat;
+    return [x, y];
+  }
+
+  function ringsToShape(ringsMeters) {
+    // ringsMeters: [ outerRing, holeRing1, holeRing2, ... ]
+    // each ring: [[x,y],...closed]
+    const outer = ringsMeters[0];
+    const shape = new THREE.Shape();
+    shape.moveTo(outer[0][0], outer[0][1]);
+    for (let i=1; i<outer.length; i++) shape.lineTo(outer[i][0], outer[i][1]);
+
+    // holes
+    for (let r=1; r<ringsMeters.length; r++) {
+      const holePts = ringsMeters[r];
+      const hole = new THREE.Path();
+      hole.moveTo(holePts[0][0], holePts[0][1]);
+      for (let i=1; i<holePts.length; i++) hole.lineTo(holePts[i][0], holePts[i][1]);
+      shape.holes.push(hole);
+    }
+
+    return shape;
+  }
+
+  function buildSTLFromBuildings(buildings, bounds) {
+    // Origin = bbox center
+    const originLon = (bounds.w + bounds.e) / 2;
+    const originLat = (bounds.s + bounds.n) / 2;
+
+    const baseThicknessMm = 2;
+    const metersToMm = 1000;
+
+    const group = new THREE.Group();
+
+    // Simple base plate (optional but helps printability)
+    const baseWidthM  = Math.abs(projectToLocalMeters(bounds.e, originLat, originLon, originLat)[0] - projectToLocalMeters(bounds.w, originLat, originLon, originLat)[0]);
+    const baseHeightM = Math.abs(projectToLocalMeters(originLon, bounds.n, originLon, originLat)[1] - projectToLocalMeters(originLon, bounds.s, originLon, originLat)[1]);
+
+    const baseGeom = new THREE.BoxGeometry(baseWidthM*metersToMm, baseThicknessMm, baseHeightM*metersToMm);
+    const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
+    baseMesh.position.set(0, baseThicknessMm/2, 0);
+    group.add(baseMesh);
+
+    // Buildings
+    for (const b of buildings) {
+      const hM = parseHeightMeters(b.tags);
+      const hMm = hM * metersToMm;
+
+      const ringsMeters = b.rings.map(ring =>
+        ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat))
+      );
+
+      // Ensure ring is closed
+      for (const ring of ringsMeters) {
+        const first = ring[0];
+        const last = ring[ring.length-1];
+        if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
+      }
+
+      const shape = ringsToShape(ringsMeters);
+
+      // Use earcut triangulation for robustness
+      THREE.ShapeUtils.triangulateShape = (contour, holes) => {
+        const vertices = [];
+        const holeIndices = [];
+        contour.forEach(p => vertices.push(p.x, p.y));
+        let holeIndex = contour.length;
+        holes.forEach(h => {
+          holeIndices.push(holeIndex);
+          h.forEach(p => vertices.push(p.x, p.y));
+          holeIndex += h.length;
+        });
+        const indices = earcut(vertices, holeIndices, 2);
+        const tris = [];
+        for (let i = 0; i < indices.length; i += 3) {
+          tris.push([indices[i], indices[i+1], indices[i+2]]);
+        }
+        return tris;
+      };
+
+      const geom = new THREE.ExtrudeGeometry(shape, {
+        depth: hMm,
+        bevelEnabled: false
+      });
+
+      // Put buildings on top of base
+      geom.rotateX(-Math.PI/2); // make Z forward for print orientation
+      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+      mesh.position.y = baseThicknessMm;
+      group.add(mesh);
+    }
+
+    // Export STL (binary)
+    const exporter = new STLExporter();
+    const arrayBuffer = exporter.parse(group, { binary: true });
+
+    return new Blob([arrayBuffer], { type: "application/octet-stream" });
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  genBtn.addEventListener("click", async () => {
+    if (!currentBounds) return;
+
+    try {
+      genBtn.disabled = true;
+      statusEl.textContent = "Fetching buildings…";
+
+      const osm = await fetchBuildingsOSM(currentBounds);
+      const buildings = osmToPolygons(osm);
+
+      statusEl.textContent = `Building meshes… (${buildings.length} footprints)`;
+
+      if (buildings.length === 0) {
+        statusEl.textContent = "No buildings found in this area. Try a city block with more structures.";
+        genBtn.disabled = false;
+        return;
+      }
+
+      const stlBlob = buildSTLFromBuildings(buildings, currentBounds);
+
+      statusEl.textContent = "Exporting STL…";
+      downloadBlob(stlBlob, "buildings.stl");
+      statusEl.textContent = "Done! Downloaded buildings.stl";
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = `Error: ${err.message}`;
+    } finally {
+      if (currentBounds) genBtn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
