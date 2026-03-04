@@ -280,7 +280,7 @@
     return shape;
   }
 
-  function autoFitZ(group, maxZtoXY = 0.1) {
+  function autoFitZ(group, maxZtoXY = 0.2) {
     // Ensure Z isn't absurd relative to XY (prevents needle models).
     const box = new THREE.Box3().setFromObject(group);
     const size = new THREE.Vector3();
