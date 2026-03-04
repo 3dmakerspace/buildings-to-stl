@@ -322,10 +322,10 @@
     const baseWidthM  = Math.abs(projectToLocalMeters(bounds.e, originLat, originLon, originLat)[0] - projectToLocalMeters(bounds.w, originLat, originLon, originLat)[0]);
     const baseHeightM = Math.abs(projectToLocalMeters(originLon, bounds.n, originLon, originLat)[1] - projectToLocalMeters(originLon, bounds.s, originLon, originLat)[1]);
 
-    const baseGeom = new THREE.BoxGeometry(baseWidthM*metersToMm, baseThicknessMm, baseHeightM*metersToMm);
-    const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
-    baseMesh.position.set(0, baseThicknessMm/2, 0);
-    group.add(baseMesh);
+ // Base plate with thickness in Z (so slicers see it as "height")
+const baseGeom = new THREE.BoxGeometry(baseWidthM*metersToMm, baseHeightM*metersToMm, baseThicknessMm);
+const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
+baseMesh.position.set(0, 0, baseThicknessMm / 2);
 
     // Buildings
     for (const b of buildings) {
@@ -364,16 +364,16 @@
         return tris;
       };
 
-      const geom = new THREE.ExtrudeGeometry(shape, {
-        depth: hMm,
-        bevelEnabled: false
-      });
+const geom = new THREE.ExtrudeGeometry(shape, {
+  depth: hMm,          // this extrudes along +Z (perfect for printing)
+  bevelEnabled: false
+});
 
-      // Put buildings on top of base
-      geom.rotateX(-Math.PI/2); // make Z forward for print orientation
-      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-      mesh.position.y = baseThicknessMm;
-      group.add(mesh);
+const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+
+// Put buildings on top of the base in Z
+mesh.position.z = baseThicknessMm;
+group.add(mesh);
     }
 
     // Export STL (binary)
