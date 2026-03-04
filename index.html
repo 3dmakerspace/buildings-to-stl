@@ -260,22 +260,36 @@
   }
 
   function parseHeightMeters(tags) {
-    // Prefer explicit height in meters if present.
-    // OSM height can be like "12", "12.5", or "12 m"
-    const DEFAULT_H = 12;
+  const DEFAULT_H = 12;
 
-    if (tags) {
-      if (tags.height) {
-        const m = String(tags.height).match(/([\d.]+)/);
-        if (m) return Math.max(3, parseFloat(m[1]));
-      }
-      if (tags["building:levels"]) {
-        const lvl = parseFloat(tags["building:levels"]);
-        if (Number.isFinite(lvl)) return Math.max(3, lvl * 3.0);
-      }
+  if (!tags) return DEFAULT_H;
+
+  // 1) height tag (try to interpret units)
+  if (tags.height) {
+    const raw = String(tags.height).toLowerCase().trim();
+
+    // extract number
+    const m = raw.match(/([\d.]+)/);
+    if (m) {
+      const val = parseFloat(m[1]);
+      if (!Number.isFinite(val)) return DEFAULT_H;
+
+      // if contains 'ft' assume feet
+      if (raw.includes("ft") || raw.includes("feet")) return Math.max(3, val * 0.3048);
+
+      // if contains 'm' or no unit, assume meters
+      return Math.max(3, val);
     }
-    return DEFAULT_H;
   }
+
+  // 2) building:levels
+  if (tags["building:levels"]) {
+    const lvl = parseFloat(tags["building:levels"]);
+    if (Number.isFinite(lvl)) return Math.max(3, lvl * 3.0);
+  }
+
+  return DEFAULT_H;
+}
 
   // ---------- Geometry: lon/lat -> local meters ----------
   function projectToLocalMeters(lon, lat, originLon, originLat) {
@@ -313,8 +327,12 @@
     const originLon = (bounds.w + bounds.e) / 2;
     const originLat = (bounds.s + bounds.n) / 2;
 
-    const baseThicknessMm = 2;
-    const metersToMm = 1000;
+   // --- Print scaling ---
+// STL is unitless; we will define "1 unit = 1 mm" by scaling meters -> mm.
+const metersToUnits = 1000;     // meters -> mm
+const globalScale = 1.0;        // change to 0.5 if everything feels too big, 2.0 if too small
+
+const baseThickness = 2 * globalScale; // mm
 
     const group = new THREE.Group();
 
@@ -323,14 +341,22 @@
     const baseHeightM = Math.abs(projectToLocalMeters(originLon, bounds.n, originLon, originLat)[1] - projectToLocalMeters(originLon, bounds.s, originLon, originLat)[1]);
 
  // Base plate with thickness in Z (so slicers see it as "height")
-const baseGeom = new THREE.BoxGeometry(baseWidthM*metersToMm, baseHeightM*metersToMm, baseThicknessMm);
+const baseGeom = new THREE.BoxGeometry(
+  baseWidthM  * metersToUnits * globalScale,
+  baseHeightM * metersToUnits * globalScale,
+  baseThickness
+);
 const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
-baseMesh.position.set(0, 0, baseThicknessMm / 2);
+baseMesh.position.set(0, 0, baseThickness / 2);
 
     // Buildings
     for (const b of buildings) {
-      const hM = parseHeightMeters(b.tags);
-      const hMm = hM * metersToMm;
+      let hM = parseHeightMeters(b.tags);
+
+// Clamp insane heights (common cause of sticks)
+hM = Math.max(3, Math.min(80, hM)); // 3m to 80m
+
+const hUnits = hM * metersToUnits * globalScale;
 
       const ringsMeters = b.rings.map(ring =>
         ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat))
@@ -365,14 +391,14 @@ baseMesh.position.set(0, 0, baseThicknessMm / 2);
       };
 
 const geom = new THREE.ExtrudeGeometry(shape, {
-  depth: hMm,          // this extrudes along +Z (perfect for printing)
+  depth: hUnits,          // this extrudes along +Z (perfect for printing)
   bevelEnabled: false
 });
 
 const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
 
 // Put buildings on top of the base in Z
-mesh.position.z = baseThicknessMm;
+mesh.position.z = baseThickness;
 group.add(mesh);
     }
 
