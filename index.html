@@ -68,6 +68,7 @@
         Base thickness: <span class="mono">2 mm</span><br/>
         Default building height: <span class="mono">12 m</span><br/>
         Height from OSM: <span class="mono">height</span> or <span class="mono">building:levels × 3m</span><br/>
+        Auto-fit Z: <span class="mono">ON</span> (prevents needle models)
       </div>
     </div>
 
@@ -84,9 +85,9 @@
 
 <script type="module">
   import * as THREE from "three";
-  import { STLExporter } from "three/addons/exporters/STLExporter.js"; // STLExporter docs :contentReference[oaicite:2]{index=2}
+  import { STLExporter } from "three/addons/exporters/STLExporter.js";
 
-  // ---------- Map ----------
+  // ------------------ MAP ------------------
   const map = new maplibregl.Map({
     container: "map",
     style: "https://demotiles.maplibre.org/style.json",
@@ -95,7 +96,7 @@
   });
   map.addControl(new maplibregl.NavigationControl(), "top-right");
 
-  // ---------- UI state ----------
+  // ------------------ UI STATE ------------------
   let isDragging = false;
   let startLngLat = null;
   let currentBounds = null; // {w,s,e,n}
@@ -113,10 +114,7 @@
   function rectToFeature(w, s, e, n) {
     return {
       type: "Feature",
-      geometry: {
-        type: "Polygon",
-        coordinates: [[[w,s],[e,s],[e,n],[w,n],[w,s]]]
-      },
+      geometry: { type: "Polygon", coordinates: [[[w,s],[e,s],[e,n],[w,n],[w,s]]] },
       properties: {}
     };
   }
@@ -126,20 +124,6 @@
     map.addSource("selection", { type: "geojson", data: { type:"FeatureCollection", features: [] }});
     map.addLayer({ id:"selection-fill", type:"fill", source:"selection", paint:{ "fill-opacity": 0.15 }});
     map.addLayer({ id:"selection-line", type:"line", source:"selection", paint:{ "line-width": 3 }});
-  }
-
-  function updateSelection(bounds) {
-    currentBounds = bounds;
-    const { w, s, e, n } = bounds;
-    boundsEl.textContent = `${w.toFixed(6)}, ${s.toFixed(6)}, ${e.toFixed(6)}, ${n.toFixed(6)}`;
-    statusEl.textContent = "Selection ready.";
-    setButtons(true);
-
-    ensureSelectionLayer();
-    map.getSource("selection").setData({
-      type:"FeatureCollection",
-      features:[rectToFeature(w,s,e,n)]
-    });
   }
 
   map.on("load", () => {
@@ -194,10 +178,9 @@
     map.getSource("selection").setData({ type:"FeatureCollection", features:[] });
   });
 
-  // ---------- Buildings via Overpass ----------
-  // We fetch OSM building ways + relations inside the bounding box.
+  // ------------------ OVERPASS (BUILDINGS) ------------------
   function overpassQueryForBuildings({w,s,e,n}) {
-    // Overpass bbox is: (south,west,north,east)
+    // Overpass bbox: (south,west,north,east)
     return `
       [out:json][timeout:25];
       (
@@ -212,8 +195,6 @@
 
   async function fetchBuildingsOSM(bounds) {
     const query = overpassQueryForBuildings(bounds);
-    // Public Overpass endpoints vary; this one is commonly used for demos.
-    // If it fails, you can swap endpoint later.
     const endpoint = "https://overpass-api.de/api/interpreter";
     const res = await fetch(endpoint, {
       method: "POST",
@@ -225,18 +206,14 @@
   }
 
   function osmToPolygons(osmJson) {
-    // Build node map
     const nodes = new Map();
     const ways = [];
-    const relations = [];
 
     for (const el of osmJson.elements) {
       if (el.type === "node") nodes.set(el.id, [el.lon, el.lat]);
       else if (el.type === "way") ways.push(el);
-      else if (el.type === "relation") relations.push(el);
     }
 
-    // Convert ways to rings (simple: only closed ways)
     const polys = [];
 
     for (const w of ways) {
@@ -246,71 +223,53 @@
 
       const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
       if (ring.length >= 4) {
-        polys.push({
-          rings: [ring],
-          tags: w.tags
-        });
+        polys.push({ rings: [ring], tags: w.tags });
       }
     }
 
-    // NOTE: Relations (multipolygons) are ignored in this MVP for simplicity.
-    // We can add them next once MVP works.
-
+    // Relations/multipolygons not handled yet (next upgrade)
     return polys;
   }
 
   function parseHeightMeters(tags) {
-  const DEFAULT_H = 12;
+    const DEFAULT_H = 12;
+    if (!tags) return DEFAULT_H;
 
-  if (!tags) return DEFAULT_H;
-
-  // 1) height tag (try to interpret units)
-  if (tags.height) {
-    const raw = String(tags.height).toLowerCase().trim();
-
-    // extract number
-    const m = raw.match(/([\d.]+)/);
-    if (m) {
-      const val = parseFloat(m[1]);
-      if (!Number.isFinite(val)) return DEFAULT_H;
-
-      // if contains 'ft' assume feet
-      if (raw.includes("ft") || raw.includes("feet")) return Math.max(3, val * 0.3048);
-
-      // if contains 'm' or no unit, assume meters
-      return Math.max(3, val);
+    if (tags.height) {
+      const raw = String(tags.height).toLowerCase().trim();
+      const m = raw.match(/([\d.]+)/);
+      if (m) {
+        const val = parseFloat(m[1]);
+        if (!Number.isFinite(val)) return DEFAULT_H;
+        if (raw.includes("ft") || raw.includes("feet")) return Math.max(3, val * 0.3048);
+        return Math.max(3, val); // meters
+      }
     }
+
+    if (tags["building:levels"]) {
+      const lvl = parseFloat(tags["building:levels"]);
+      if (Number.isFinite(lvl)) return Math.max(3, lvl * 3.0);
+    }
+
+    return DEFAULT_H;
   }
 
-  // 2) building:levels
-  if (tags["building:levels"]) {
-    const lvl = parseFloat(tags["building:levels"]);
-    if (Number.isFinite(lvl)) return Math.max(3, lvl * 3.0);
-  }
-
-  return DEFAULT_H;
-}
-
-  // ---------- Geometry: lon/lat -> local meters ----------
+  // ------------------ GEOMETRY HELPERS ------------------
   function projectToLocalMeters(lon, lat, originLon, originLat) {
-    // Equirectangular approximation around origin (good for small areas)
-    const R = 6378137; // meters
+    const R = 6378137;
     const dLon = (lon - originLon) * Math.PI / 180;
     const dLat = (lat - originLat) * Math.PI / 180;
     const x = R * dLon * Math.cos(originLat * Math.PI / 180);
     const y = R * dLat;
-    return [x, y];
+    return [x, y]; // meters
   }
 
   function ringsToShape(ringsMeters) {
-    // ringsMeters: [ outerRing, holeRing1, holeRing2, ... ]
-    // each ring: [[x,y],...closed]
     const outer = ringsMeters[0];
     const shape = new THREE.Shape();
     shape.moveTo(outer[0][0], outer[0][1]);
     for (let i=1; i<outer.length; i++) shape.lineTo(outer[i][0], outer[i][1]);
 
-    // holes
     for (let r=1; r<ringsMeters.length; r++) {
       const holePts = ringsMeters[r];
       const hole = new THREE.Path();
@@ -318,51 +277,70 @@
       for (let i=1; i<holePts.length; i++) hole.lineTo(holePts[i][0], holePts[i][1]);
       shape.holes.push(hole);
     }
-
     return shape;
   }
 
+  function autoFitZ(group, maxZtoXY = 0.35) {
+    // Ensure Z isn't absurd relative to XY (prevents needle models).
+    const box = new THREE.Box3().setFromObject(group);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+
+    const xy = Math.max(size.x, size.y);
+    const z = size.z;
+
+    if (xy <= 0 || z <= 0) return;
+
+    const targetMaxZ = xy * maxZtoXY;
+    if (z > targetMaxZ) {
+      const scaleZ = targetMaxZ / z;
+      group.scale.set(1, 1, scaleZ);
+    }
+  }
+
+  // ------------------ BUILD STL ------------------
   function buildSTLFromBuildings(buildings, bounds) {
-    // Origin = bbox center
     const originLon = (bounds.w + bounds.e) / 2;
     const originLat = (bounds.s + bounds.n) / 2;
 
-   // --- Print scaling ---
-// STL is unitless; we will define "1 unit = 1 mm" by scaling meters -> mm.
-const metersToUnits = 1000;     // meters -> mm
-const globalScale = 1.0;        // change to 0.5 if everything feels too big, 2.0 if too small
+    // STL is unitless; we choose 1 unit = 1 mm
+    const metersToUnits = 1000;   // meters -> mm
+    const globalScale = 1.0;
 
-const baseThickness = 2 * globalScale; // mm
+    const baseThickness = 2 * globalScale; // mm
 
     const group = new THREE.Group();
 
-    // Simple base plate (optional but helps printability)
-    const baseWidthM  = Math.abs(projectToLocalMeters(bounds.e, originLat, originLon, originLat)[0] - projectToLocalMeters(bounds.w, originLat, originLon, originLat)[0]);
-    const baseHeightM = Math.abs(projectToLocalMeters(originLon, bounds.n, originLon, originLat)[1] - projectToLocalMeters(originLon, bounds.s, originLon, originLat)[1]);
+    // Base size in meters (local projection)
+    const baseWidthM  =
+      Math.abs(projectToLocalMeters(bounds.e, originLat, originLon, originLat)[0] -
+               projectToLocalMeters(bounds.w, originLat, originLon, originLat)[0]);
 
- // Base plate with thickness in Z (so slicers see it as "height")
-const baseGeom = new THREE.BoxGeometry(
-  baseWidthM  * metersToUnits * globalScale,
-  baseHeightM * metersToUnits * globalScale,
-  baseThickness
-);
-const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
-baseMesh.position.set(0, 0, baseThickness / 2);
+    const baseHeightM =
+      Math.abs(projectToLocalMeters(originLon, bounds.n, originLon, originLat)[1] -
+               projectToLocalMeters(originLon, bounds.s, originLon, originLat)[1]);
+
+    // Base: thickness in Z
+    const baseGeom = new THREE.BoxGeometry(
+      baseWidthM  * metersToUnits * globalScale,
+      baseHeightM * metersToUnits * globalScale,
+      baseThickness
+    );
+    const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
+    baseMesh.position.set(0, 0, baseThickness / 2);
+    group.add(baseMesh); // <-- YOU WERE MISSING THIS IN YOUR FILE
 
     // Buildings
     for (const b of buildings) {
       let hM = parseHeightMeters(b.tags);
-
-// Clamp insane heights (common cause of sticks)
-hM = Math.max(3, Math.min(80, hM)); // 3m to 80m
-
-const hUnits = hM * metersToUnits * globalScale;
+      hM = Math.max(3, Math.min(80, hM)); // clamp
+      const hUnits = hM * metersToUnits * globalScale; // mm
 
       const ringsMeters = b.rings.map(ring =>
         ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat))
       );
 
-      // Ensure ring is closed
+      // Close rings
       for (const ring of ringsMeters) {
         const first = ring[0];
         const last = ring[ring.length-1];
@@ -371,7 +349,7 @@ const hUnits = hM * metersToUnits * globalScale;
 
       const shape = ringsToShape(ringsMeters);
 
-      // Use earcut triangulation for robustness
+      // Earcut triangulation
       THREE.ShapeUtils.triangulateShape = (contour, holes) => {
         const vertices = [];
         const holeIndices = [];
@@ -384,28 +362,26 @@ const hUnits = hM * metersToUnits * globalScale;
         });
         const indices = earcut(vertices, holeIndices, 2);
         const tris = [];
-        for (let i = 0; i < indices.length; i += 3) {
-          tris.push([indices[i], indices[i+1], indices[i+2]]);
-        }
+        for (let i = 0; i < indices.length; i += 3) tris.push([indices[i], indices[i+1], indices[i+2]]);
         return tris;
       };
 
-const geom = new THREE.ExtrudeGeometry(shape, {
-  depth: hUnits,          // this extrudes along +Z (perfect for printing)
-  bevelEnabled: false
-});
+      const geom = new THREE.ExtrudeGeometry(shape, {
+        depth: hUnits,          // extrudes along +Z
+        bevelEnabled: false
+      });
 
-const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-
-// Put buildings on top of the base in Z
-mesh.position.z = baseThickness;
-group.add(mesh);
+      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+      mesh.position.z = baseThickness; // sit on base
+      group.add(mesh);
     }
+
+    // Auto-normalize Z so slicers don't show needle-cities
+    autoFitZ(group, 0.35); // lower=flatter, higher=taller
 
     // Export STL (binary)
     const exporter = new STLExporter();
     const arrayBuffer = exporter.parse(group, { binary: true });
-
     return new Blob([arrayBuffer], { type: "application/octet-stream" });
   }
 
@@ -420,6 +396,7 @@ group.add(mesh);
     URL.revokeObjectURL(url);
   }
 
+  // ------------------ GENERATE BUTTON ------------------
   genBtn.addEventListener("click", async () => {
     if (!currentBounds) return;
 
