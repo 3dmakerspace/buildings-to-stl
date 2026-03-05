@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Buildings → STL (Map2Model-style)</title>
+  <title>OSM → Multi-STL (Buildings + Roads + Parks + Water)</title>
 
   <!-- MapLibre -->
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.12.0/dist/maplibre-gl.css" />
@@ -19,13 +19,13 @@
     }
   </script>
 
-  <!-- Earcut for polygon triangulation -->
+  <!-- Earcut -->
   <script src="https://unpkg.com/earcut@2.2.4/dist/earcut.min.js"></script>
 
   <style>
     html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
-    #app { height: 100%; display: grid; grid-template-columns: 360px 1fr; }
-    #panel { padding: 14px; border-right: 1px solid #e6e6e6; }
+    #app { height: 100%; display: grid; grid-template-columns: 380px 1fr; }
+    #panel { padding: 14px; border-right: 1px solid #e6e6e6; overflow:auto; }
     #map { height: 100%; }
     .btn { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #111; background:#111; color:#fff; font-weight:700; cursor:pointer;}
     .btn.secondary { background:#fff; color:#111; }
@@ -36,17 +36,23 @@
     .row { display:flex; gap:10px; margin-top:10px; }
     .row > * { flex: 1; }
     .warn { color:#8a4b00; }
+    label.chk { display:flex; align-items:center; gap:10px; margin-top:8px; user-select:none; }
+    input[type="checkbox"] { width:16px; height:16px; }
+    .pill { display:inline-block; border:1px solid #ddd; border-radius:999px; padding:2px 8px; font-size:12px; color:#444; }
   </style>
 </head>
 
 <body>
 <div id="app">
   <div id="panel">
-    <h2 style="margin:0 0 8px 0;">Buildings → STL</h2>
+    <h2 style="margin:0 0 8px 0;">OSM → Multi-STL</h2>
     <div class="small">
-      Drag a rectangle on the map, then generate an STL of building extrusions inside that area.
+      Drag a rectangle. Exports separate STLs for <b>base</b>, <b>buildings</b>, <b>roads</b>, <b>parks</b>, <b>water</b>.
       <div class="warn" style="margin-top:8px;">
-        Keep the selection small (a few city blocks) for the first test.
+        Tip: Import all STLs into your slicer at once, then assign colors per object.
+      </div>
+      <div class="small" style="margin-top:8px;">
+        <span class="pill">MVP note</span> Parks/water multipolygon relations aren’t handled yet (some areas may miss those).
       </div>
     </div>
 
@@ -58,25 +64,30 @@
 
       <div class="row">
         <button id="clearBtn" class="btn secondary" disabled>Clear</button>
-        <button id="genBtn" class="btn" disabled>Generate STL</button>
+        <button id="genBtn" class="btn" disabled>Export STLs</button>
       </div>
     </div>
 
     <div class="card">
-      <div style="font-weight:800;">Model settings (simple MVP)</div>
-      <div class="small" style="margin-top:8px;">
-        Base thickness: <span class="mono">2 mm</span><br/>
-        Default building height: <span class="mono">12 m</span><br/>
-        Height from OSM: <span class="mono">height</span> or <span class="mono">building:levels × 3m</span><br/>
-        Footprints: <span class="mono">clipped to selection</span><br/>
-        Units: <span class="mono">meters → scaled to mm at export</span>
+      <div style="font-weight:800;">Features to export</div>
+
+      <label class="chk"><input id="fBase" type="checkbox" checked /> Base</label>
+      <label class="chk"><input id="fBuildings" type="checkbox" checked /> Buildings</label>
+      <label class="chk"><input id="fRoads" type="checkbox" checked /> Roads</label>
+      <label class="chk"><input id="fParks" type="checkbox" checked /> Parks / Greens</label>
+      <label class="chk"><input id="fWater" type="checkbox" checked /> Water</label>
+
+      <div class="small" style="margin-top:10px;">
+        <b>Layer heights (mm):</b><br/>
+        Base: <span class="mono">2.0</span> • Roads: <span class="mono">1.0</span> • Parks: <span class="mono">0.8</span> • Water: <span class="mono">0.6</span><br/>
+        Buildings start above the top feature layer (prevents collisions).
       </div>
     </div>
 
     <div class="card">
       <div style="font-weight:800;">Attribution</div>
       <div class="small" style="margin-top:8px;">
-        Buildings data: OpenStreetMap contributors. Please include attribution if you publish outputs.
+        Data: OpenStreetMap contributors. Please include attribution if you publish outputs.
       </div>
     </div>
   </div>
@@ -106,6 +117,12 @@
   const boundsEl = document.getElementById("bounds");
   const clearBtn = document.getElementById("clearBtn");
   const genBtn = document.getElementById("genBtn");
+
+  const fBase = document.getElementById("fBase");
+  const fBuildings = document.getElementById("fBuildings");
+  const fRoads = document.getElementById("fRoads");
+  const fParks = document.getElementById("fParks");
+  const fWater = document.getElementById("fWater");
 
   function setButtons(hasSelection) {
     clearBtn.disabled = !hasSelection;
@@ -179,14 +196,27 @@
     map.getSource("selection").setData({ type:"FeatureCollection", features:[] });
   });
 
-  // ------------------ OVERPASS (BUILDINGS) ------------------
-  function overpassQueryForBuildings({w,s,e,n}) {
-    // Overpass bbox: (south,west,north,east)
+  // ------------------ OVERPASS ------------------
+  function overpassQuery(bounds) {
+    const { w, s, e, n } = bounds;
     return `
-      [out:json][timeout:25];
+      [out:json][timeout:40];
       (
         way["building"](${s},${w},${n},${e});
         relation["building"](${s},${w},${n},${e});
+
+        way["highway"](${s},${w},${n},${e});
+
+        way["leisure"="park"](${s},${w},${n},${e});
+        way["landuse"="grass"](${s},${w},${n},${e});
+        way["landuse"="meadow"](${s},${w},${n},${e});
+        way["landuse"="forest"](${s},${w},${n},${e});
+        way["natural"="wood"](${s},${w},${n},${e});
+
+        way["natural"="water"](${s},${w},${n},${e});
+        way["waterway"="riverbank"](${s},${w},${n},${e});
+        way["waterway"="river"](${s},${w},${n},${e});
+        way["waterway"="canal"](${s},${w},${n},${e});
       );
       out body;
       >;
@@ -194,8 +224,8 @@
     `.trim();
   }
 
-  async function fetchBuildingsOSM(bounds) {
-    const query = overpassQueryForBuildings(bounds);
+  async function fetchOSM(bounds) {
+    const query = overpassQuery(bounds);
     const endpoint = "https://overpass-api.de/api/interpreter";
     const res = await fetch(endpoint, {
       method: "POST",
@@ -206,7 +236,24 @@
     return await res.json();
   }
 
-  function osmToPolygons(osmJson) {
+  // ------------------ PARSING ------------------
+  function isClosedWay(way) {
+    return way.nodes && way.nodes.length >= 4 && way.nodes[0] === way.nodes[way.nodes.length - 1];
+  }
+
+  function tagEq(tags, k, v) {
+    return tags && tags[k] === v;
+  }
+
+  function hasAnyTag(tags, checks) {
+    if (!tags) return false;
+    for (const [k, v] of checks) {
+      if (tags[k] === v) return true;
+    }
+    return false;
+  }
+
+  function osmParse(osmJson) {
     const nodes = new Map();
     const ways = [];
 
@@ -215,18 +262,58 @@
       else if (el.type === "way") ways.push(el);
     }
 
-    const polys = [];
-    for (const w of ways) {
-      if (!w.tags || !w.tags.building) continue;
-      if (!w.nodes || w.nodes.length < 4) continue;
-      if (w.nodes[0] !== w.nodes[w.nodes.length - 1]) continue;
+    const buildings = [];
+    const parks = [];
+    const waterPolys = [];
+    const roads = [];      // centerlines
+    const waterways = [];  // line waterways
 
-      const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
-      if (ring.length >= 4) polys.push({ rings: [ring], tags: w.tags });
+    for (const w of ways) {
+      const tags = w.tags || {};
+
+      // Buildings (polygons)
+      if (tags.building && isClosedWay(w)) {
+        const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+        if (ring.length >= 4) buildings.push({ ring, tags });
+        continue;
+      }
+
+      // Parks/greens (polygons)
+      if (isClosedWay(w) && (
+        tagEq(tags, "leisure", "park") ||
+        hasAnyTag(tags, [["landuse","grass"],["landuse","meadow"],["landuse","forest"],["natural","wood"]])
+      )) {
+        const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+        if (ring.length >= 4) parks.push({ ring, tags });
+        continue;
+      }
+
+      // Water polygons
+      if (isClosedWay(w) && (
+        tagEq(tags, "natural", "water") ||
+        tagEq(tags, "waterway", "riverbank")
+      )) {
+        const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+        if (ring.length >= 4) waterPolys.push({ ring, tags });
+        continue;
+      }
+
+      // Roads (lines)
+      if (tags.highway && w.nodes && w.nodes.length >= 2) {
+        const pts = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+        if (pts.length >= 2) roads.push({ pts, tags });
+        continue;
+      }
+
+      // Waterways (lines)
+      if ((tags.waterway === "river" || tags.waterway === "canal") && w.nodes && w.nodes.length >= 2) {
+        const pts = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+        if (pts.length >= 2) waterways.push({ pts, tags });
+        continue;
+      }
     }
 
-    // Relations/multipolygons not handled yet (next upgrade)
-    return polys;
+    return { buildings, parks, waterPolys, roads, waterways };
   }
 
   function parseHeightMeters(tags) {
@@ -253,7 +340,6 @@
   }
 
   // ------------------ GEOMETRY HELPERS ------------------
-  // Local meters (equirectangular approximation) around origin
   function projectToLocalMeters(lon, lat, originLon, originLat) {
     const R = 6378137;
     const dLon = (lon - originLon) * Math.PI / 180;
@@ -263,14 +349,6 @@
     return [x, y]; // meters
   }
 
-  function closeRing(points) {
-    if (points.length < 3) return points;
-    const a = points[0], b = points[points.length - 1];
-    if (a[0] !== b[0] || a[1] !== b[1]) points.push([a[0], a[1]]);
-    return points;
-  }
-
-  // Compute selection bbox in local meters from the 4 corners (robust)
   function selectionRectMeters(bounds, originLon, originLat) {
     const cornersLL = [
       [bounds.w, bounds.s],
@@ -291,12 +369,16 @@
     return { minX, maxX, minY, maxY, cx, cy, w: (maxX-minX), h: (maxY-minY) };
   }
 
-  // Sutherland–Hodgman polygon clipping against axis-aligned rectangle
-  // Input: open polygon (no repeated last point) in XY meters
-  function clipPolygonToRect(poly, rect) {
-    // guard
-    if (!poly || poly.length < 3) return [];
+  function closeRing(points) {
+    if (points.length < 3) return points;
+    const a = points[0], b = points[points.length - 1];
+    if (a[0] !== b[0] || a[1] !== b[1]) points.push([a[0], a[1]]);
+    return points;
+  }
 
+  // Sutherland–Hodgman polygon clipping against axis-aligned rectangle
+  function clipPolygonToRect(poly, rect) {
+    if (!poly || poly.length < 3) return [];
     const { minX, maxX, minY, maxY } = rect;
 
     function clipEdge(points, insideFn, intersectFn) {
@@ -307,49 +389,40 @@
         const Ain = insideFn(A);
         const Bin = insideFn(B);
 
-        if (Ain && Bin) {
-          out.push(B);
-        } else if (Ain && !Bin) {
-          out.push(intersectFn(A, B));
-        } else if (!Ain && Bin) {
-          out.push(intersectFn(A, B));
-          out.push(B);
-        }
+        if (Ain && Bin) out.push(B);
+        else if (Ain && !Bin) out.push(intersectFn(A, B));
+        else if (!Ain && Bin) { out.push(intersectFn(A, B)); out.push(B); }
       }
       return out;
     }
 
     function intersectVertical(A, B, x) {
       const [x1,y1] = A, [x2,y2] = B;
-      const t = (x - x1) / (x2 - x1);
+      const dx = (x2 - x1);
+      if (Math.abs(dx) < 1e-12) return [x, y1];
+      const t = (x - x1) / dx;
       return [x, y1 + t * (y2 - y1)];
     }
 
     function intersectHorizontal(A, B, y) {
       const [x1,y1] = A, [x2,y2] = B;
-      const t = (y - y1) / (y2 - y1);
+      const dy = (y2 - y1);
+      if (Math.abs(dy) < 1e-12) return [x1, y];
+      const t = (y - y1) / dy;
       return [x1 + t * (x2 - x1), y];
     }
 
     let out = poly;
-
-    // Left
     out = clipEdge(out, ([x,_y]) => x >= minX, (A,B) => intersectVertical(A,B,minX));
     if (out.length < 3) return [];
-
-    // Right
     out = clipEdge(out, ([x,_y]) => x <= maxX, (A,B) => intersectVertical(A,B,maxX));
     if (out.length < 3) return [];
-
-    // Bottom
     out = clipEdge(out, ([_x,y]) => y >= minY, (A,B) => intersectHorizontal(A,B,minY));
     if (out.length < 3) return [];
-
-    // Top
     out = clipEdge(out, ([_x,y]) => y <= maxY, (A,B) => intersectHorizontal(A,B,maxY));
     if (out.length < 3) return [];
 
-    // Remove near-duplicates caused by clipping
+    // remove near-duplicates
     const cleaned = [];
     const eps = 1e-9;
     for (const p of out) {
@@ -361,8 +434,51 @@
       const last = cleaned[cleaned.length - 1];
       if (Math.abs(first[0]-last[0]) < eps && Math.abs(first[1]-last[1]) < eps) cleaned.pop();
     }
-
     return cleaned;
+  }
+
+  // Cohen–Sutherland line clipping to rect
+  function clipSegmentToRect(A, B, rect) {
+    const { minX, maxX, minY, maxY } = rect;
+    const INSIDE = 0, LEFT = 1, RIGHT = 2, BOTTOM = 4, TOP = 8;
+
+    function outCode(x, y) {
+      let code = INSIDE;
+      if (x < minX) code |= LEFT;
+      else if (x > maxX) code |= RIGHT;
+      if (y < minY) code |= BOTTOM;
+      else if (y > maxY) code |= TOP;
+      return code;
+    }
+
+    let x0 = A[0], y0 = A[1], x1 = B[0], y1 = B[1];
+    let c0 = outCode(x0, y0);
+    let c1 = outCode(x1, y1);
+
+    while (true) {
+      if (!(c0 | c1)) return [[x0,y0],[x1,y1]];       // accept
+      if (c0 & c1) return null;                       // reject
+
+      const out = c0 ? c0 : c1;
+      let x, y;
+
+      if (out & TOP) {
+        x = x0 + (x1 - x0) * (maxY - y0) / (y1 - y0);
+        y = maxY;
+      } else if (out & BOTTOM) {
+        x = x0 + (x1 - x0) * (minY - y0) / (y1 - y0);
+        y = minY;
+      } else if (out & RIGHT) {
+        y = y0 + (y1 - y0) * (maxX - x0) / (x1 - x0);
+        x = maxX;
+      } else { // LEFT
+        y = y0 + (y1 - y0) * (minX - x0) / (x1 - x0);
+        x = minX;
+      }
+
+      if (out === c0) { x0 = x; y0 = y; c0 = outCode(x0,y0); }
+      else { x1 = x; y1 = y; c1 = outCode(x1,y1); }
+    }
   }
 
   function ringsToShape(ringsMeters) {
@@ -370,36 +486,80 @@
     const shape = new THREE.Shape();
     shape.moveTo(outer[0][0], outer[0][1]);
     for (let i=1; i<outer.length; i++) shape.lineTo(outer[i][0], outer[i][1]);
-
-    for (let r=1; r<ringsMeters.length; r++) {
-      const holePts = ringsMeters[r];
-      const hole = new THREE.Path();
-      hole.moveTo(holePts[0][0], holePts[0][1]);
-      for (let i=1; i<holePts.length; i++) hole.lineTo(holePts[i][0], holePts[i][1]);
-      shape.holes.push(hole);
-    }
+    // holes omitted for MVP
     return shape;
   }
 
-  // ------------------ BUILD STL ------------------
-  function buildSTLFromBuildings(buildings, bounds) {
+  // Road width by highway class (meters)
+  function roadWidthMeters(tags) {
+    const t = (tags && tags.highway) ? String(tags.highway) : "residential";
+    const table = {
+      motorway: 14, trunk: 12, primary: 10, secondary: 8, tertiary: 7,
+      unclassified: 6, residential: 6, living_street: 5, service: 4,
+      pedestrian: 4, footway: 2, path: 2, cycleway: 2, steps: 2, track: 3
+    };
+    return table[t] ?? 5;
+  }
+
+  function waterwayWidthMeters(tags) {
+    const t = (tags && tags.waterway) ? String(tags.waterway) : "river";
+    if (t === "canal") return 8;
+    return 12; // river default
+  }
+
+  // Build a rectangle (quad) polygon around a line segment with given width
+  function quadForSegment(A, B, widthM) {
+    const x0=A[0], y0=A[1], x1=B[0], y1=B[1];
+    const dx = x1-x0, dy = y1-y0;
+    const len = Math.hypot(dx,dy);
+    if (len < 1e-9) return null;
+    const ux = dx/len, uy = dy/len;
+    const nx = -uy, ny = ux;
+    const hw = widthM/2;
+    return [
+      [x0 + nx*hw, y0 + ny*hw],
+      [x0 - nx*hw, y0 - ny*hw],
+      [x1 - nx*hw, y1 - ny*hw],
+      [x1 + nx*hw, y1 + ny*hw]
+    ];
+  }
+
+  // ------------------ STL EXPORT HELPERS ------------------
+  const exporter = new STLExporter();
+
+  function exportSTLFromGroup(group, filename) {
+    const arrayBuffer = exporter.parse(group, { binary: true });
+    const blob = new Blob([arrayBuffer], { type: "application/octet-stream" });
+    downloadBlob(blob, filename);
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // ------------------ BUILD MULTI FEATURE GROUPS ------------------
+  function buildGroups(data, bounds) {
     const originLon = (bounds.w + bounds.e) / 2;
     const originLat = (bounds.s + bounds.n) / 2;
-
     const rect = selectionRectMeters(bounds, originLon, originLat);
 
-    const group = new THREE.Group();
+    // meters inside Three.js; scale to mm at end
+    const baseThicknessM = 0.002;
+    const roadsDepthM    = 0.0010;
+    const parksDepthM    = 0.0008;
+    const waterDepthM    = 0.0006;
 
-    // meters inside three.js, scale to mm at end
-    const baseThicknessM = 0.002; // 2mm
+    const topFeatureM = baseThicknessM + Math.max(roadsDepthM, parksDepthM, waterDepthM);
+    const buildingZ0  = topFeatureM; // buildings start above features to avoid overlap collisions
 
-    // Base sized exactly to selection rectangle in projected meters
-    const baseGeom = new THREE.BoxGeometry(rect.w, rect.h, baseThicknessM);
-    const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
-    baseMesh.position.set(0, 0, baseThicknessM / 2);
-    group.add(baseMesh);
-
-    // Earcut triangulation hook for ExtrudeGeometry
+    // Triangulation hook for ExtrudeGeometry
     THREE.ShapeUtils.triangulateShape = (contour, holes) => {
       const vertices = [];
       const holeIndices = [];
@@ -416,89 +576,154 @@
       return tris;
     };
 
-    let kept = 0;
+    const gBase = new THREE.Group();
+    const gBuildings = new THREE.Group();
+    const gRoads = new THREE.Group();
+    const gParks = new THREE.Group();
+    const gWater = new THREE.Group();
 
-    for (const b of buildings) {
-      let hM = parseHeightMeters(b.tags);
-      hM = Math.max(3, Math.min(120, hM)); // clamp meters
+    // Base (exact selection rectangle)
+    {
+      const baseGeom = new THREE.BoxGeometry(rect.w, rect.h, baseThicknessM);
+      const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
+      baseMesh.position.set(0, 0, baseThicknessM/2);
+      gBase.add(baseMesh);
+    }
 
-      // Project to meters
-      const ring0 = b.rings[0].map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
-
-      // Remove repeated last point if present (for clipping input)
-      const open = ring0.slice();
+    // Parks polys
+    for (const p of data.parks) {
+      const ring = p.ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
+      const open = ring.slice();
       if (open.length >= 2) {
-        const a = open[0], z = open[open.length - 1];
+        const a = open[0], z = open[open.length-1];
         if (a[0] === z[0] && a[1] === z[1]) open.pop();
       }
+      const clipped = clipPolygonToRect(open, rect);
+      if (clipped.length < 3) continue;
+      const centered = closeRing(clipped.map(([x,y]) => [x - rect.cx, y - rect.cy]));
+      const shape = ringsToShape([centered]);
+      const geom = new THREE.ExtrudeGeometry(shape, { depth: parksDepthM, bevelEnabled:false });
+      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+      mesh.position.z = baseThicknessM; // sits on base
+      gParks.add(mesh);
+    }
 
-      // Clip to selection rectangle
+    // Water polygons
+    for (const w of data.waterPolys) {
+      const ring = w.ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
+      const open = ring.slice();
+      if (open.length >= 2) {
+        const a = open[0], z = open[open.length-1];
+        if (a[0] === z[0] && a[1] === z[1]) open.pop();
+      }
+      const clipped = clipPolygonToRect(open, rect);
+      if (clipped.length < 3) continue;
+      const centered = closeRing(clipped.map(([x,y]) => [x - rect.cx, y - rect.cy]));
+      const shape = ringsToShape([centered]);
+      const geom = new THREE.ExtrudeGeometry(shape, { depth: waterDepthM, bevelEnabled:false });
+      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+      mesh.position.z = baseThicknessM;
+      gWater.add(mesh);
+    }
+
+    // Roads (as segment quads)
+    function addLineAsRoadQuads(linePtsLL, widthM, depthM, group) {
+      // project whole polyline to meters first
+      const pts = linePtsLL.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
+      for (let i=0; i<pts.length-1; i++) {
+        const A = pts[i], B = pts[i+1];
+        const clippedSeg = clipSegmentToRect(A, B, rect);
+        if (!clippedSeg) continue;
+        const [C, D] = clippedSeg;
+        const quad = quadForSegment(C, D, widthM);
+        if (!quad) continue;
+        // center
+        const centeredOpen = quad.map(([x,y]) => [x - rect.cx, y - rect.cy]);
+        const centered = closeRing(centeredOpen.slice());
+        const shape = ringsToShape([centered]);
+        const geom = new THREE.ExtrudeGeometry(shape, { depth: depthM, bevelEnabled:false });
+        const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
+        mesh.position.z = baseThicknessM;
+        group.add(mesh);
+      }
+    }
+
+    for (const r of data.roads) {
+      const wM = roadWidthMeters(r.tags);
+      addLineAsRoadQuads(r.pts, wM, roadsDepthM, gRoads);
+    }
+    // line waterways as “wide roads” in water layer
+    for (const wl of data.waterways) {
+      const wM = waterwayWidthMeters(wl.tags);
+      addLineAsRoadQuads(wl.pts, wM, waterDepthM, gWater);
+    }
+
+    // Buildings (polys)
+    for (const b of data.buildings) {
+      let hM = parseHeightMeters(b.tags);
+      hM = Math.max(3, Math.min(120, hM)); // clamp
+      const ring = b.ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
+      const open = ring.slice();
+      if (open.length >= 2) {
+        const a = open[0], z = open[open.length-1];
+        if (a[0] === z[0] && a[1] === z[1]) open.pop();
+      }
       const clipped = clipPolygonToRect(open, rect);
       if (clipped.length < 3) continue;
 
-      // Close + center so base and buildings align
       const centered = closeRing(clipped.map(([x,y]) => [x - rect.cx, y - rect.cy]));
-
-      // Build shape
       const shape = ringsToShape([centered]);
-
-      const geom = new THREE.ExtrudeGeometry(shape, {
-        depth: hM,
-        bevelEnabled: false
-      });
-
+      const geom = new THREE.ExtrudeGeometry(shape, { depth: hM, bevelEnabled:false });
       const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-      mesh.position.z = baseThicknessM;
-      group.add(mesh);
-      kept++;
+      mesh.position.z = buildingZ0;
+      gBuildings.add(mesh);
     }
 
-    if (kept === 0) {
-      console.warn("No buildings survived clipping. Try a denser area.");
-    }
+    // Scale ALL groups to mm for STL
+    for (const g of [gBase, gBuildings, gRoads, gParks, gWater]) g.scale.set(1000,1000,1000);
 
-    // scale to millimeters for STL
-    group.scale.set(1000, 1000, 1000);
-
-    const exporter = new STLExporter();
-    const arrayBuffer = exporter.parse(group, { binary: true });
-    return new Blob([arrayBuffer], { type: "application/octet-stream" });
-  }
-
-  function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    return { gBase, gBuildings, gRoads, gParks, gWater, stats: {
+      buildings: data.buildings.length,
+      roads: data.roads.length,
+      parks: data.parks.length,
+      waterPolys: data.waterPolys.length,
+      waterways: data.waterways.length
+    }};
   }
 
   // ------------------ GENERATE BUTTON ------------------
   genBtn.addEventListener("click", async () => {
     if (!currentBounds) return;
 
+    const anyFeature = fBase.checked || fBuildings.checked || fRoads.checked || fParks.checked || fWater.checked;
+    if (!anyFeature) {
+      statusEl.textContent = "Pick at least one feature checkbox.";
+      return;
+    }
+
     try {
       genBtn.disabled = true;
-      statusEl.textContent = "Fetching buildings…";
+      statusEl.textContent = "Fetching OSM…";
 
-      const osm = await fetchBuildingsOSM(currentBounds);
-      const buildings = osmToPolygons(osm);
+      const osm = await fetchOSM(currentBounds);
+      const parsed = osmParse(osm);
 
-      statusEl.textContent = `Meshing… (${buildings.length} footprints)`;
+      statusEl.textContent =
+        `Building meshes… (bld=${parsed.buildings.length}, roads=${parsed.roads.length}, parks=${parsed.parks.length}, water=${parsed.waterPolys.length})`;
 
-      if (buildings.length === 0) {
-        statusEl.textContent = "No buildings found in this area. Try a city block with more structures.";
-        genBtn.disabled = false;
-        return;
-      }
+      const { gBase, gBuildings, gRoads, gParks, gWater } = buildGroups(parsed, currentBounds);
 
-      statusEl.textContent = "Exporting STL…";
-      const stlBlob = buildSTLFromBuildings(buildings, currentBounds);
-      downloadBlob(stlBlob, "buildings.stl");
-      statusEl.textContent = "Done! Downloaded buildings.stl";
+      statusEl.textContent = "Exporting STLs… (downloads will start)";
+
+      // Download selected
+      // Note: browsers may block multiple auto-downloads; allow popups/downloads if prompted.
+      if (fBase.checked)      exportSTLFromGroup(gBase,      "base.stl");
+      if (fParks.checked)     exportSTLFromGroup(gParks,     "parks.stl");
+      if (fWater.checked)     exportSTLFromGroup(gWater,     "water.stl");
+      if (fRoads.checked)     exportSTLFromGroup(gRoads,     "roads.stl");
+      if (fBuildings.checked) exportSTLFromGroup(gBuildings, "buildings.stl");
+
+      statusEl.textContent = "Done! Import all STLs together in your slicer and assign colors per object.";
     } catch (err) {
       console.error(err);
       statusEl.textContent = `Error: ${err.message}`;
