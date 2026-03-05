@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>OSM → Multi-STL (Buildings + Roads + Parks + Water)</title>
+  <title>OSM → Multi-STL (Buildings + Roads + Parks + Water) + Multipolygons</title>
 
   <!-- MapLibre -->
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.12.0/dist/maplibre-gl.css" />
@@ -52,7 +52,7 @@
         Tip: Import all STLs into your slicer at once, then assign colors per object.
       </div>
       <div class="small" style="margin-top:8px;">
-        <span class="pill">MVP note</span> Parks/water multipolygon relations aren’t handled yet (some areas may miss those).
+        <span class="pill">Multipolygons ON</span> Parks/water/buildings relations are now supported (outer/inner rings).
       </div>
     </div>
 
@@ -200,7 +200,7 @@
   function overpassQuery(bounds) {
     const { w, s, e, n } = bounds;
     return `
-      [out:json][timeout:40];
+      [out:json][timeout:60];
       (
         way["building"](${s},${w},${n},${e});
         relation["building"](${s},${w},${n},${e});
@@ -208,13 +208,22 @@
         way["highway"](${s},${w},${n},${e});
 
         way["leisure"="park"](${s},${w},${n},${e});
+        relation["leisure"="park"](${s},${w},${n},${e});
+
         way["landuse"="grass"](${s},${w},${n},${e});
         way["landuse"="meadow"](${s},${w},${n},${e});
         way["landuse"="forest"](${s},${w},${n},${e});
         way["natural"="wood"](${s},${w},${n},${e});
+        relation["landuse"="grass"](${s},${w},${n},${e});
+        relation["landuse"="meadow"](${s},${w},${n},${e});
+        relation["landuse"="forest"](${s},${w},${n},${e});
+        relation["natural"="wood"](${s},${w},${n},${e});
 
         way["natural"="water"](${s},${w},${n},${e});
         way["waterway"="riverbank"](${s},${w},${n},${e});
+        relation["natural"="water"](${s},${w},${n},${e});
+        relation["waterway"="riverbank"](${s},${w},${n},${e});
+
         way["waterway"="river"](${s},${w},${n},${e});
         way["waterway"="canal"](${s},${w},${n},${e});
       );
@@ -241,75 +250,252 @@
     return way.nodes && way.nodes.length >= 4 && way.nodes[0] === way.nodes[way.nodes.length - 1];
   }
 
-  function tagEq(tags, k, v) {
-    return tags && tags[k] === v;
-  }
-
   function hasAnyTag(tags, checks) {
     if (!tags) return false;
-    for (const [k, v] of checks) {
-      if (tags[k] === v) return true;
-    }
+    for (const [k, v] of checks) if (tags[k] === v) return true;
     return false;
   }
 
-  function osmParse(osmJson) {
-    const nodes = new Map();
-    const ways = [];
+  function isParkTags(tags) {
+    return !!(tags && (
+      tags.leisure === "park" ||
+      hasAnyTag(tags, [["landuse","grass"],["landuse","meadow"],["landuse","forest"],["natural","wood"]])
+    ));
+  }
 
-    for (const el of osmJson.elements) {
-      if (el.type === "node") nodes.set(el.id, [el.lon, el.lat]);
-      else if (el.type === "way") ways.push(el);
+  function isWaterPolyTags(tags) {
+    return !!(tags && (tags.natural === "water" || tags.waterway === "riverbank"));
+  }
+
+  function isBuildingTags(tags) {
+    return !!(tags && tags.building);
+  }
+
+  // Build a closed ring (node id chain) from multiple member ways (stitches segments).
+  // Returns array of rings, each ring is an array of node ids (closed: first==last).
+  function assembleRingsFromMemberWays(memberWayIds, waysById) {
+    const segments = [];
+    for (const wid of memberWayIds) {
+      const w = waysById.get(wid);
+      if (!w || !w.nodes || w.nodes.length < 2) continue;
+      segments.push({ wid, nodes: w.nodes.slice() });
     }
 
+    const unused = new Set(segments.map(s => s.wid));
+    const segById = new Map(segments.map(s => [s.wid, s]));
+
+    const rings = [];
+    const maxSteps = 20000;
+
+    function takeAnyUnused() {
+      for (const id of unused) return id;
+      return null;
+    }
+
+    let steps = 0;
+    while (unused.size > 0) {
+      if (++steps > maxSteps) break;
+
+      const startId = takeAnyUnused();
+      if (!startId) break;
+
+      const seg0 = segById.get(startId);
+      unused.delete(startId);
+
+      let chain = seg0.nodes.slice(); // node ids
+      let guard = 0;
+
+      while (guard++ < 10000) {
+        const first = chain[0];
+        const last = chain[chain.length - 1];
+
+        if (chain.length >= 4 && first === last) {
+          rings.push(chain);
+          break;
+        }
+
+        let found = false;
+
+        // find a segment whose start/end matches current end
+        for (const id of unused) {
+          const seg = segById.get(id);
+          if (!seg) continue;
+          const a = seg.nodes[0];
+          const b = seg.nodes[seg.nodes.length - 1];
+
+          if (a === last) {
+            // append seg (skip duplicate join node)
+            chain = chain.concat(seg.nodes.slice(1));
+            unused.delete(id);
+            found = true;
+            break;
+          } else if (b === last) {
+            // append reversed seg
+            const rev = seg.nodes.slice().reverse();
+            chain = chain.concat(rev.slice(1));
+            unused.delete(id);
+            found = true;
+            break;
+          } else if (a === first) {
+            // prepend reversed seg
+            const rev = seg.nodes.slice().reverse();
+            chain = rev.slice(0, rev.length - 1).concat(chain);
+            unused.delete(id);
+            found = true;
+            break;
+          } else if (b === first) {
+            // prepend seg
+            chain = seg.nodes.slice(0, seg.nodes.length - 1).concat(chain);
+            unused.delete(id);
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) {
+          // Could not close; store as-is if it's at least a polygon-ish loop
+          if (chain.length >= 4) {
+            // try force close if endpoints nearly match by id (they don't) -> skip
+          }
+          break;
+        }
+      }
+    }
+
+    return rings;
+  }
+
+  // Build multipolygon features: returns array of {rings:[outer, ...holes], tags}
+  // Each ring is lon/lat points closed.
+  function buildMultipolygonFeatures(rel, nodesById, waysById) {
+    const tags = rel.tags || {};
+    const members = rel.members || [];
+    const outerWayIds = members.filter(m => m.type === "way" && m.role === "outer").map(m => m.ref);
+    const innerWayIds = members.filter(m => m.type === "way" && m.role === "inner").map(m => m.ref);
+
+    if (outerWayIds.length === 0) return [];
+
+    const outerNodeRings = assembleRingsFromMemberWays(outerWayIds, waysById);
+    const innerNodeRings = assembleRingsFromMemberWays(innerWayIds, waysById);
+
+    const outerRingsLL = outerNodeRings
+      .map(r => r.map(nid => nodesById.get(nid)).filter(Boolean))
+      .filter(r => r.length >= 4 && r[0][0] !== undefined);
+
+    const innerRingsLL = innerNodeRings
+      .map(r => r.map(nid => nodesById.get(nid)).filter(Boolean))
+      .filter(r => r.length >= 4 && r[0][0] !== undefined);
+
+    // If no outers resolved, bail
+    if (outerRingsLL.length === 0) return [];
+
+    // Assign holes to outers by point-in-polygon on lon/lat (good enough for assignment)
+    function pointInPoly(pt, poly) {
+      const x = pt[0], y = pt[1];
+      let inside = false;
+      for (let i=0, j=poly.length-1; i<poly.length; j=i++) {
+        const xi = poly[i][0], yi = poly[i][1];
+        const xj = poly[j][0], yj = poly[j][1];
+        const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / ((yj - yi) || 1e-30) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
+    const features = outerRingsLL.map(outer => ({ rings: [outer], tags }));
+    for (const hole of innerRingsLL) {
+      const probe = hole[0];
+      let assigned = false;
+      for (const f of features) {
+        if (pointInPoly(probe, f.rings[0])) {
+          f.rings.push(hole);
+          assigned = true;
+          break;
+        }
+      }
+      // if unassigned, ignore (often from partial data)
+      if (!assigned) {}
+    }
+
+    return features;
+  }
+
+  function osmParse(osmJson) {
+    const nodesById = new Map();
+    const waysById = new Map();
+    const ways = [];
+    const relations = [];
+
+    for (const el of osmJson.elements) {
+      if (el.type === "node") nodesById.set(el.id, [el.lon, el.lat]);
+      else if (el.type === "way") { ways.push(el); waysById.set(el.id, el); }
+      else if (el.type === "relation") relations.push(el);
+    }
+
+    // Final feature collections:
+    // polygons: { rings:[outer, ...holes], tags }
     const buildings = [];
     const parks = [];
     const waterPolys = [];
-    const roads = [];      // centerlines
+    const roads = [];      // centerlines: {pts:[lonlat...], tags}
     const waterways = [];  // line waterways
 
+    // Ways first
     for (const w of ways) {
       const tags = w.tags || {};
 
       // Buildings (polygons)
-      if (tags.building && isClosedWay(w)) {
-        const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
-        if (ring.length >= 4) buildings.push({ ring, tags });
+      if (isBuildingTags(tags) && isClosedWay(w)) {
+        const ring = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
+        if (ring.length >= 4) buildings.push({ rings: [ring], tags });
         continue;
       }
 
       // Parks/greens (polygons)
-      if (isClosedWay(w) && (
-        tagEq(tags, "leisure", "park") ||
-        hasAnyTag(tags, [["landuse","grass"],["landuse","meadow"],["landuse","forest"],["natural","wood"]])
-      )) {
-        const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
-        if (ring.length >= 4) parks.push({ ring, tags });
+      if (isParkTags(tags) && isClosedWay(w)) {
+        const ring = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
+        if (ring.length >= 4) parks.push({ rings: [ring], tags });
         continue;
       }
 
       // Water polygons
-      if (isClosedWay(w) && (
-        tagEq(tags, "natural", "water") ||
-        tagEq(tags, "waterway", "riverbank")
-      )) {
-        const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
-        if (ring.length >= 4) waterPolys.push({ ring, tags });
+      if (isWaterPolyTags(tags) && isClosedWay(w)) {
+        const ring = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
+        if (ring.length >= 4) waterPolys.push({ rings: [ring], tags });
         continue;
       }
 
       // Roads (lines)
       if (tags.highway && w.nodes && w.nodes.length >= 2) {
-        const pts = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+        const pts = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
         if (pts.length >= 2) roads.push({ pts, tags });
         continue;
       }
 
       // Waterways (lines)
       if ((tags.waterway === "river" || tags.waterway === "canal") && w.nodes && w.nodes.length >= 2) {
-        const pts = w.nodes.map(id => nodes.get(id)).filter(Boolean);
+        const pts = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
         if (pts.length >= 2) waterways.push({ pts, tags });
         continue;
+      }
+    }
+
+    // Relations (multipolygons)
+    for (const rel of relations) {
+      const tags = rel.tags || {};
+      const type = tags.type;
+
+      // Most area relations are multipolygon (or boundary in some cases)
+      const isMulti = (type === "multipolygon" || type === "boundary");
+
+      if (!isMulti) continue;
+
+      if (isBuildingTags(tags)) {
+        buildings.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
+      } else if (isParkTags(tags)) {
+        parks.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
+      } else if (isWaterPolyTags(tags)) {
+        waterPolys.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
       }
     }
 
@@ -374,6 +560,25 @@
     const a = points[0], b = points[points.length - 1];
     if (a[0] !== b[0] || a[1] !== b[1]) points.push([a[0], a[1]]);
     return points;
+  }
+
+  function signedArea(poly) {
+    // expects open or closed; works either way
+    let a = 0;
+    for (let i=0; i<poly.length; i++) {
+      const [x1,y1] = poly[i];
+      const [x2,y2] = poly[(i+1) % poly.length];
+      a += (x1*y2 - x2*y1);
+    }
+    return a / 2;
+  }
+
+  function ensureWinding(outer, holes) {
+    // Three.js: outer should be CCW, holes should be CW
+    if (signedArea(outer) < 0) outer.reverse();
+    for (const h of holes) {
+      if (signedArea(h) > 0) h.reverse();
+    }
   }
 
   // Sutherland–Hodgman polygon clipping against axis-aligned rectangle
@@ -456,8 +661,8 @@
     let c1 = outCode(x1, y1);
 
     while (true) {
-      if (!(c0 | c1)) return [[x0,y0],[x1,y1]];       // accept
-      if (c0 & c1) return null;                       // reject
+      if (!(c0 | c1)) return [[x0,y0],[x1,y1]];
+      if (c0 & c1) return null;
 
       const out = c0 ? c0 : c1;
       let x, y;
@@ -471,7 +676,7 @@
       } else if (out & RIGHT) {
         y = y0 + (y1 - y0) * (maxX - x0) / (x1 - x0);
         x = maxX;
-      } else { // LEFT
+      } else {
         y = y0 + (y1 - y0) * (minX - x0) / (x1 - x0);
         x = minX;
       }
@@ -481,12 +686,19 @@
     }
   }
 
-  function ringsToShape(ringsMeters) {
-    const outer = ringsMeters[0];
+  // Shape with holes
+  function ringsToShapeWithHoles(outerClosed, holesClosed) {
     const shape = new THREE.Shape();
-    shape.moveTo(outer[0][0], outer[0][1]);
-    for (let i=1; i<outer.length; i++) shape.lineTo(outer[i][0], outer[i][1]);
-    // holes omitted for MVP
+    shape.moveTo(outerClosed[0][0], outerClosed[0][1]);
+    for (let i=1; i<outerClosed.length; i++) shape.lineTo(outerClosed[i][0], outerClosed[i][1]);
+
+    for (const holeRing of holesClosed) {
+      if (!holeRing || holeRing.length < 4) continue;
+      const hole = new THREE.Path();
+      hole.moveTo(holeRing[0][0], holeRing[0][1]);
+      for (let i=1; i<holeRing.length; i++) hole.lineTo(holeRing[i][0], holeRing[i][1]);
+      shape.holes.push(hole);
+    }
     return shape;
   }
 
@@ -504,10 +716,9 @@
   function waterwayWidthMeters(tags) {
     const t = (tags && tags.waterway) ? String(tags.waterway) : "river";
     if (t === "canal") return 8;
-    return 12; // river default
+    return 12;
   }
 
-  // Build a rectangle (quad) polygon around a line segment with given width
   function quadForSegment(A, B, widthM) {
     const x0=A[0], y0=A[1], x1=B[0], y1=B[1];
     const dx = x1-x0, dy = y1-y0;
@@ -557,9 +768,9 @@
     const waterDepthM    = 0.0006;
 
     const topFeatureM = baseThicknessM + Math.max(roadsDepthM, parksDepthM, waterDepthM);
-    const buildingZ0  = topFeatureM; // buildings start above features to avoid overlap collisions
+    const buildingZ0  = topFeatureM;
 
-    // Triangulation hook for ExtrudeGeometry
+    // Earcut triangulation hook for ExtrudeGeometry
     THREE.ShapeUtils.triangulateShape = (contour, holes) => {
       const vertices = [];
       const holeIndices = [];
@@ -582,7 +793,7 @@
     const gParks = new THREE.Group();
     const gWater = new THREE.Group();
 
-    // Base (exact selection rectangle)
+    // Base
     {
       const baseGeom = new THREE.BoxGeometry(rect.w, rect.h, baseThicknessM);
       const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
@@ -590,45 +801,58 @@
       gBase.add(baseMesh);
     }
 
-    // Parks polys
-    for (const p of data.parks) {
-      const ring = p.ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
-      const open = ring.slice();
-      if (open.length >= 2) {
-        const a = open[0], z = open[open.length-1];
-        if (a[0] === z[0] && a[1] === z[1]) open.pop();
+    // ---- Polygon feature helper (supports holes via rings[0]=outer, rings[1+]=holes) ----
+    function addPolygonFeature(feature, depthM, group, z0M) {
+      const ringsLL = feature.rings;
+      if (!ringsLL || ringsLL.length === 0) return;
+
+      // project each ring
+      const ringsM = ringsLL.map(ringLL =>
+        ringLL.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat))
+      );
+
+      // prepare open rings for clipping (remove duplicate last point if present)
+      const openRingsM = ringsM.map(r => {
+        const rr = r.slice();
+        if (rr.length >= 2) {
+          const a = rr[0], z = rr[rr.length - 1];
+          if (a[0] === z[0] && a[1] === z[1]) rr.pop();
+        }
+        return rr;
+      });
+
+      // clip outer
+      const outerOpen = clipPolygonToRect(openRingsM[0], rect);
+      if (outerOpen.length < 3) return;
+
+      // clip holes (keep only those that still exist)
+      const holesOpen = [];
+      for (let i=1; i<openRingsM.length; i++) {
+        const h = clipPolygonToRect(openRingsM[i], rect);
+        if (h.length >= 3) holesOpen.push(h);
       }
-      const clipped = clipPolygonToRect(open, rect);
-      if (clipped.length < 3) continue;
-      const centered = closeRing(clipped.map(([x,y]) => [x - rect.cx, y - rect.cy]));
-      const shape = ringsToShape([centered]);
-      const geom = new THREE.ExtrudeGeometry(shape, { depth: parksDepthM, bevelEnabled:false });
+
+      // center + close
+      const outer = closeRing(outerOpen.map(([x,y]) => [x - rect.cx, y - rect.cy]));
+      const holes = holesOpen.map(h => closeRing(h.map(([x,y]) => [x - rect.cx, y - rect.cy])));
+
+      ensureWinding(outer, holes);
+
+      const shape = ringsToShapeWithHoles(outer, holes);
+      const geom = new THREE.ExtrudeGeometry(shape, { depth: depthM, bevelEnabled:false });
       const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-      mesh.position.z = baseThicknessM; // sits on base
-      gParks.add(mesh);
+      mesh.position.z = z0M;
+      group.add(mesh);
     }
+
+    // Parks
+    for (const p of data.parks) addPolygonFeature(p, parksDepthM, gParks, baseThicknessM);
 
     // Water polygons
-    for (const w of data.waterPolys) {
-      const ring = w.ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
-      const open = ring.slice();
-      if (open.length >= 2) {
-        const a = open[0], z = open[open.length-1];
-        if (a[0] === z[0] && a[1] === z[1]) open.pop();
-      }
-      const clipped = clipPolygonToRect(open, rect);
-      if (clipped.length < 3) continue;
-      const centered = closeRing(clipped.map(([x,y]) => [x - rect.cx, y - rect.cy]));
-      const shape = ringsToShape([centered]);
-      const geom = new THREE.ExtrudeGeometry(shape, { depth: waterDepthM, bevelEnabled:false });
-      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-      mesh.position.z = baseThicknessM;
-      gWater.add(mesh);
-    }
+    for (const w of data.waterPolys) addPolygonFeature(w, waterDepthM, gWater, baseThicknessM);
 
     // Roads (as segment quads)
-    function addLineAsRoadQuads(linePtsLL, widthM, depthM, group) {
-      // project whole polyline to meters first
+    function addLineAsQuads(linePtsLL, widthM, depthM, group, z0M) {
       const pts = linePtsLL.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
       for (let i=0; i<pts.length-1; i++) {
         const A = pts[i], B = pts[i+1];
@@ -637,58 +861,34 @@
         const [C, D] = clippedSeg;
         const quad = quadForSegment(C, D, widthM);
         if (!quad) continue;
-        // center
+
         const centeredOpen = quad.map(([x,y]) => [x - rect.cx, y - rect.cy]);
         const centered = closeRing(centeredOpen.slice());
-        const shape = ringsToShape([centered]);
+        if (signedArea(centered) < 0) centered.reverse();
+
+        const shape = ringsToShapeWithHoles(centered, []);
         const geom = new THREE.ExtrudeGeometry(shape, { depth: depthM, bevelEnabled:false });
         const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-        mesh.position.z = baseThicknessM;
+        mesh.position.z = z0M;
         group.add(mesh);
       }
     }
 
-    for (const r of data.roads) {
-      const wM = roadWidthMeters(r.tags);
-      addLineAsRoadQuads(r.pts, wM, roadsDepthM, gRoads);
-    }
-    // line waterways as “wide roads” in water layer
-    for (const wl of data.waterways) {
-      const wM = waterwayWidthMeters(wl.tags);
-      addLineAsRoadQuads(wl.pts, wM, waterDepthM, gWater);
-    }
+    for (const r of data.roads) addLineAsQuads(r.pts, roadWidthMeters(r.tags), roadsDepthM, gRoads, baseThicknessM);
+    for (const wl of data.waterways) addLineAsQuads(wl.pts, waterwayWidthMeters(wl.tags), waterDepthM, gWater, baseThicknessM);
 
-    // Buildings (polys)
+    // Buildings
     for (const b of data.buildings) {
+      // if relation/way has a height tag, use it; else default
       let hM = parseHeightMeters(b.tags);
-      hM = Math.max(3, Math.min(120, hM)); // clamp
-      const ring = b.ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
-      const open = ring.slice();
-      if (open.length >= 2) {
-        const a = open[0], z = open[open.length-1];
-        if (a[0] === z[0] && a[1] === z[1]) open.pop();
-      }
-      const clipped = clipPolygonToRect(open, rect);
-      if (clipped.length < 3) continue;
-
-      const centered = closeRing(clipped.map(([x,y]) => [x - rect.cx, y - rect.cy]));
-      const shape = ringsToShape([centered]);
-      const geom = new THREE.ExtrudeGeometry(shape, { depth: hM, bevelEnabled:false });
-      const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-      mesh.position.z = buildingZ0;
-      gBuildings.add(mesh);
+      hM = Math.max(3, Math.min(200, hM));
+      addPolygonFeature(b, hM, gBuildings, buildingZ0);
     }
 
-    // Scale ALL groups to mm for STL
+    // Scale to mm
     for (const g of [gBase, gBuildings, gRoads, gParks, gWater]) g.scale.set(1000,1000,1000);
 
-    return { gBase, gBuildings, gRoads, gParks, gWater, stats: {
-      buildings: data.buildings.length,
-      roads: data.roads.length,
-      parks: data.parks.length,
-      waterPolys: data.waterPolys.length,
-      waterways: data.waterways.length
-    }};
+    return { gBase, gBuildings, gRoads, gParks, gWater };
   }
 
   // ------------------ GENERATE BUTTON ------------------
@@ -709,14 +909,13 @@
       const parsed = osmParse(osm);
 
       statusEl.textContent =
-        `Building meshes… (bld=${parsed.buildings.length}, roads=${parsed.roads.length}, parks=${parsed.parks.length}, water=${parsed.waterPolys.length})`;
+        `Meshing… buildings=${parsed.buildings.length}, roads=${parsed.roads.length}, parks=${parsed.parks.length}, water=${parsed.waterPolys.length}`;
 
       const { gBase, gBuildings, gRoads, gParks, gWater } = buildGroups(parsed, currentBounds);
 
       statusEl.textContent = "Exporting STLs… (downloads will start)";
 
-      // Download selected
-      // Note: browsers may block multiple auto-downloads; allow popups/downloads if prompted.
+      // Browsers may block multiple downloads—allow if prompted.
       if (fBase.checked)      exportSTLFromGroup(gBase,      "base.stl");
       if (fParks.checked)     exportSTLFromGroup(gParks,     "parks.stl");
       if (fWater.checked)     exportSTLFromGroup(gWater,     "water.stl");
