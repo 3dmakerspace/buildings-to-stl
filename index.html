@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>OSM → Multi-STL (Buildings + Roads + Parks + Water) + Multipolygons</title>
+  <title>OSM → Multi-STL (Buildings + Roads + Parks + Water) + Pro Map</title>
 
   <!-- MapLibre -->
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.12.0/dist/maplibre-gl.css" />
@@ -24,8 +24,8 @@
 
   <style>
     html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
-    #app { height: 100%; display: grid; grid-template-columns: 380px 1fr; }
-    #panel { padding: 14px; border-right: 1px solid #e6e6e6; overflow:auto; }
+    #app { height: 100%; display: grid; grid-template-columns: 400px 1fr; }
+    #panel { padding: 14px; border-right: 1px solid #e6e6e6; overflow:auto; background:#fff; }
     #map { height: 100%; }
     .btn { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #111; background:#111; color:#fff; font-weight:700; cursor:pointer;}
     .btn.secondary { background:#fff; color:#111; }
@@ -39,6 +39,11 @@
     label.chk { display:flex; align-items:center; gap:10px; margin-top:8px; user-select:none; }
     input[type="checkbox"] { width:16px; height:16px; }
     .pill { display:inline-block; border:1px solid #ddd; border-radius:999px; padding:2px 8px; font-size:12px; color:#444; }
+    input.search {
+      width:100%; margin-top:8px; padding:10px; border-radius:10px; border:1px solid #ddd;
+      outline:none;
+    }
+    input.search:focus { border-color:#111; }
   </style>
 </head>
 
@@ -46,14 +51,27 @@
 <div id="app">
   <div id="panel">
     <h2 style="margin:0 0 8px 0;">OSM → Multi-STL</h2>
+
     <div class="small">
-      Drag a rectangle. Exports separate STLs for <b>base</b>, <b>buildings</b>, <b>roads</b>, <b>parks</b>, <b>water</b>.
+      <b>Pro controls:</b> Pan normally. Hold <span class="mono">Shift</span> + drag to select.
       <div class="warn" style="margin-top:8px;">
-        Tip: Import all STLs into your slicer at once, then assign colors per object.
+        Tip: Keep selection small (few blocks) to avoid Overpass/timeouts.
       </div>
       <div class="small" style="margin-top:8px;">
-        <span class="pill">Multipolygons ON</span> Parks/water/buildings relations are now supported (outer/inner rings).
+        <span class="pill">Satellite + Flat</span>
+        <span class="pill">Multipolygons ON</span>
+        <span class="pill">Multi-STL Export</span>
       </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800;">Search</div>
+      <input id="searchBox" class="search" placeholder="Search city / address…" />
+      <div class="row">
+        <button id="searchBtn" class="btn">Go</button>
+        <button id="homeBtn" class="btn secondary">Home</button>
+      </div>
+      <div class="small" style="margin-top:8px;">Press Enter in the search box too.</div>
     </div>
 
     <div class="card">
@@ -65,6 +83,9 @@
       <div class="row">
         <button id="clearBtn" class="btn secondary" disabled>Clear</button>
         <button id="genBtn" class="btn" disabled>Export STLs</button>
+      </div>
+      <div class="small" style="margin-top:8px;">
+        Selection mode: <b>Shift + drag</b>
       </div>
     </div>
 
@@ -80,14 +101,14 @@
       <div class="small" style="margin-top:10px;">
         <b>Layer heights (mm):</b><br/>
         Base: <span class="mono">2.0</span> • Roads: <span class="mono">1.0</span> • Parks: <span class="mono">0.8</span> • Water: <span class="mono">0.6</span><br/>
-        Buildings start above the top feature layer (prevents collisions).
+        Buildings start above the top feature layer.
       </div>
     </div>
 
     <div class="card">
       <div style="font-weight:800;">Attribution</div>
       <div class="small" style="margin-top:8px;">
-        Data: OpenStreetMap contributors. Please include attribution if you publish outputs.
+        Data: OpenStreetMap contributors. If you publish outputs, include attribution.
       </div>
     </div>
   </div>
@@ -99,14 +120,63 @@
   import * as THREE from "three";
   import { STLExporter } from "three/addons/exporters/STLExporter.js";
 
-  // ------------------ MAP ------------------
+  // =========================================================
+  // 1) YOU MUST SET THIS:
+  // =========================================================
+  const MAPTILER_KEY = "PASTE_YOUR_MAPTILER_KEY_HERE";
+  // Get a free key from MapTiler and paste it above.
+
+  // Styles (Satellite + detailed flat)
+  const STYLE_STREETS   = `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`;
+  const STYLE_SATELLITE = `https://api.maptiler.com/maps/satellite/style.json?key=${MAPTILER_KEY}`;
+
+  // ------------------ MAP (PRO) ------------------
   const map = new maplibregl.Map({
     container: "map",
-    style: "https://demotiles.maplibre.org/style.json",
+    style: STYLE_STREETS,
     center: [-73.9857, 40.7484],
-    zoom: 14
+    zoom: 14,
+    pitch: 0,
+    bearing: 0
   });
-  map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
+  map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-right");
+
+  // Allow rotation (right mouse drag) – pro feel
+  map.dragRotate.enable();
+  map.touchZoomRotate.enableRotation();
+
+  // Style switcher buttons
+  class StyleSwitcher {
+    onAdd(map) {
+      this._map = map;
+      this._container = document.createElement("div");
+      this._container.className = "maplibregl-ctrl maplibregl-ctrl-group";
+
+      const btnStreets = document.createElement("button");
+      btnStreets.type = "button";
+      btnStreets.title = "Detailed (Flat)";
+      btnStreets.innerHTML = "🗺️";
+
+      const btnSat = document.createElement("button");
+      btnSat.type = "button";
+      btnSat.title = "Satellite";
+      btnSat.innerHTML = "🛰️";
+
+      btnStreets.onclick = () => map.setStyle(STYLE_STREETS);
+      btnSat.onclick = () => map.setStyle(STYLE_SATELLITE);
+
+      this._container.appendChild(btnStreets);
+      this._container.appendChild(btnSat);
+      return this._container;
+    }
+    onRemove() {
+      this._container.parentNode.removeChild(this._container);
+      this._map = undefined;
+    }
+  }
+  map.addControl(new StyleSwitcher(), "top-right");
 
   // ------------------ UI STATE ------------------
   let isDragging = false;
@@ -124,6 +194,10 @@
   const fParks = document.getElementById("fParks");
   const fWater = document.getElementById("fWater");
 
+  const searchBox = document.getElementById("searchBox");
+  const searchBtn = document.getElementById("searchBtn");
+  const homeBtn = document.getElementById("homeBtn");
+
   function setButtons(hasSelection) {
     clearBtn.disabled = !hasSelection;
     genBtn.disabled = !hasSelection;
@@ -140,25 +214,44 @@
   function ensureSelectionLayer() {
     if (map.getSource("selection")) return;
     map.addSource("selection", { type: "geojson", data: { type:"FeatureCollection", features: [] }});
-    map.addLayer({ id:"selection-fill", type:"fill", source:"selection", paint:{ "fill-opacity": 0.15 }});
+    map.addLayer({ id:"selection-fill", type:"fill", source:"selection", paint:{ "fill-opacity": 0.18 }});
     map.addLayer({ id:"selection-line", type:"line", source:"selection", paint:{ "line-width": 3 }});
   }
+
+  // When switching styles, MapLibre clears custom layers/sources
+  map.on("style.load", () => {
+    ensureSelectionLayer();
+    if (currentBounds) {
+      const { w, s, e, n } = currentBounds;
+      map.getSource("selection").setData({
+        type: "FeatureCollection",
+        features: [rectToFeature(w, s, e, n)]
+      });
+    }
+  });
 
   map.on("load", () => {
     ensureSelectionLayer();
     setButtons(false);
+    statusEl.textContent = "Ready. Pan normally. Hold Shift + drag to select.";
   });
 
+  // --- Selection requires SHIFT + drag (pro UX) ---
   map.on("mousedown", (e) => {
     if (e.originalEvent.button !== 0) return;
+    if (!e.originalEvent.shiftKey) return; // ONLY select when shift is held
+
     isDragging = true;
     startLngLat = e.lngLat;
+
+    // disable pan while selecting
     map.dragPan.disable();
-    statusEl.textContent = "Selecting…";
+    statusEl.textContent = "Selecting… (Shift + drag)";
   });
 
   map.on("mousemove", (e) => {
     if (!isDragging || !startLngLat) return;
+
     const a = startLngLat;
     const b = e.lngLat;
     const w = Math.min(a.lng, b.lng);
@@ -181,19 +274,54 @@
     if (!isDragging) return;
     isDragging = false;
     startLngLat = null;
+
+    // re-enable pan
     map.dragPan.enable();
-    if (currentBounds) statusEl.textContent = "Selection ready.";
+    if (currentBounds) statusEl.textContent = "Selection ready. Click Export STLs.";
   }
   map.on("mouseup", finishDrag);
   map.on("mouseout", finishDrag);
 
   clearBtn.addEventListener("click", () => {
     currentBounds = null;
-    statusEl.textContent = "No selection yet.";
+    statusEl.textContent = "Selection cleared. Hold Shift + drag to select.";
     boundsEl.textContent = "—";
     setButtons(false);
     ensureSelectionLayer();
     map.getSource("selection").setData({ type:"FeatureCollection", features:[] });
+  });
+
+  // ------------------ SEARCH (Nominatim) ------------------
+  async function geocode(query) {
+    // For a personal prototype this is okay. For production, host your own or use a paid geocoder.
+    const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!res.ok) throw new Error("Search failed");
+    const results = await res.json();
+    return results[0] || null;
+  }
+
+  async function doSearch() {
+    const q = (searchBox.value || "").trim();
+    if (!q) return;
+    statusEl.textContent = "Searching…";
+    const hit = await geocode(q);
+    if (!hit) {
+      statusEl.textContent = "No results found.";
+      return;
+    }
+    map.flyTo({ center: [parseFloat(hit.lon), parseFloat(hit.lat)], zoom: 15 });
+    statusEl.textContent = "Search ready. Hold Shift + drag to select.";
+  }
+
+  searchBtn.addEventListener("click", () => doSearch().catch(err => statusEl.textContent = `Error: ${err.message}`));
+  searchBox.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doSearch().catch(err => statusEl.textContent = `Error: ${err.message}`);
+  });
+
+  homeBtn.addEventListener("click", () => {
+    map.flyTo({ center: [-73.9857, 40.7484], zoom: 14, bearing: 0, pitch: 0 });
+    statusEl.textContent = "Home. Hold Shift + drag to select.";
   });
 
   // ------------------ OVERPASS ------------------
@@ -271,8 +399,7 @@
     return !!(tags && tags.building);
   }
 
-  // Build a closed ring (node id chain) from multiple member ways (stitches segments).
-  // Returns array of rings, each ring is an array of node ids (closed: first==last).
+  // Stitch multiple ways into rings (node id chains)
   function assembleRingsFromMemberWays(memberWayIds, waysById) {
     const segments = [];
     for (const wid of memberWayIds) {
@@ -302,7 +429,7 @@
       const seg0 = segById.get(startId);
       unused.delete(startId);
 
-      let chain = seg0.nodes.slice(); // node ids
+      let chain = seg0.nodes.slice();
       let guard = 0;
 
       while (guard++ < 10000) {
@@ -316,7 +443,6 @@
 
         let found = false;
 
-        // find a segment whose start/end matches current end
         for (const id of unused) {
           const seg = segById.get(id);
           if (!seg) continue;
@@ -324,27 +450,23 @@
           const b = seg.nodes[seg.nodes.length - 1];
 
           if (a === last) {
-            // append seg (skip duplicate join node)
             chain = chain.concat(seg.nodes.slice(1));
             unused.delete(id);
             found = true;
             break;
           } else if (b === last) {
-            // append reversed seg
             const rev = seg.nodes.slice().reverse();
             chain = chain.concat(rev.slice(1));
             unused.delete(id);
             found = true;
             break;
           } else if (a === first) {
-            // prepend reversed seg
             const rev = seg.nodes.slice().reverse();
             chain = rev.slice(0, rev.length - 1).concat(chain);
             unused.delete(id);
             found = true;
             break;
           } else if (b === first) {
-            // prepend seg
             chain = seg.nodes.slice(0, seg.nodes.length - 1).concat(chain);
             unused.delete(id);
             found = true;
@@ -352,21 +474,13 @@
           }
         }
 
-        if (!found) {
-          // Could not close; store as-is if it's at least a polygon-ish loop
-          if (chain.length >= 4) {
-            // try force close if endpoints nearly match by id (they don't) -> skip
-          }
-          break;
-        }
+        if (!found) break;
       }
     }
 
     return rings;
   }
 
-  // Build multipolygon features: returns array of {rings:[outer, ...holes], tags}
-  // Each ring is lon/lat points closed.
   function buildMultipolygonFeatures(rel, nodesById, waysById) {
     const tags = rel.tags || {};
     const members = rel.members || [];
@@ -386,10 +500,8 @@
       .map(r => r.map(nid => nodesById.get(nid)).filter(Boolean))
       .filter(r => r.length >= 4 && r[0][0] !== undefined);
 
-    // If no outers resolved, bail
     if (outerRingsLL.length === 0) return [];
 
-    // Assign holes to outers by point-in-polygon on lon/lat (good enough for assignment)
     function pointInPoly(pt, poly) {
       const x = pt[0], y = pt[1];
       let inside = false;
@@ -405,18 +517,13 @@
     const features = outerRingsLL.map(outer => ({ rings: [outer], tags }));
     for (const hole of innerRingsLL) {
       const probe = hole[0];
-      let assigned = false;
       for (const f of features) {
         if (pointInPoly(probe, f.rings[0])) {
           f.rings.push(hole);
-          assigned = true;
           break;
         }
       }
-      // if unassigned, ignore (often from partial data)
-      if (!assigned) {}
     }
-
     return features;
   }
 
@@ -432,47 +539,39 @@
       else if (el.type === "relation") relations.push(el);
     }
 
-    // Final feature collections:
-    // polygons: { rings:[outer, ...holes], tags }
     const buildings = [];
     const parks = [];
     const waterPolys = [];
-    const roads = [];      // centerlines: {pts:[lonlat...], tags}
-    const waterways = [];  // line waterways
+    const roads = [];
+    const waterways = [];
 
-    // Ways first
     for (const w of ways) {
       const tags = w.tags || {};
 
-      // Buildings (polygons)
       if (isBuildingTags(tags) && isClosedWay(w)) {
         const ring = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
         if (ring.length >= 4) buildings.push({ rings: [ring], tags });
         continue;
       }
 
-      // Parks/greens (polygons)
       if (isParkTags(tags) && isClosedWay(w)) {
         const ring = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
         if (ring.length >= 4) parks.push({ rings: [ring], tags });
         continue;
       }
 
-      // Water polygons
       if (isWaterPolyTags(tags) && isClosedWay(w)) {
         const ring = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
         if (ring.length >= 4) waterPolys.push({ rings: [ring], tags });
         continue;
       }
 
-      // Roads (lines)
       if (tags.highway && w.nodes && w.nodes.length >= 2) {
         const pts = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
         if (pts.length >= 2) roads.push({ pts, tags });
         continue;
       }
 
-      // Waterways (lines)
       if ((tags.waterway === "river" || tags.waterway === "canal") && w.nodes && w.nodes.length >= 2) {
         const pts = w.nodes.map(id => nodesById.get(id)).filter(Boolean);
         if (pts.length >= 2) waterways.push({ pts, tags });
@@ -480,23 +579,15 @@
       }
     }
 
-    // Relations (multipolygons)
     for (const rel of relations) {
       const tags = rel.tags || {};
       const type = tags.type;
-
-      // Most area relations are multipolygon (or boundary in some cases)
       const isMulti = (type === "multipolygon" || type === "boundary");
-
       if (!isMulti) continue;
 
-      if (isBuildingTags(tags)) {
-        buildings.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
-      } else if (isParkTags(tags)) {
-        parks.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
-      } else if (isWaterPolyTags(tags)) {
-        waterPolys.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
-      }
+      if (isBuildingTags(tags)) buildings.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
+      else if (isParkTags(tags)) parks.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
+      else if (isWaterPolyTags(tags)) waterPolys.push(...buildMultipolygonFeatures(rel, nodesById, waysById));
     }
 
     return { buildings, parks, waterPolys, roads, waterways };
@@ -563,7 +654,6 @@
   }
 
   function signedArea(poly) {
-    // expects open or closed; works either way
     let a = 0;
     for (let i=0; i<poly.length; i++) {
       const [x1,y1] = poly[i];
@@ -574,14 +664,12 @@
   }
 
   function ensureWinding(outer, holes) {
-    // Three.js: outer should be CCW, holes should be CW
-    if (signedArea(outer) < 0) outer.reverse();
+    if (signedArea(outer) < 0) outer.reverse(); // outer CCW
     for (const h of holes) {
-      if (signedArea(h) > 0) h.reverse();
+      if (signedArea(h) > 0) h.reverse(); // holes CW
     }
   }
 
-  // Sutherland–Hodgman polygon clipping against axis-aligned rectangle
   function clipPolygonToRect(poly, rect) {
     if (!poly || poly.length < 3) return [];
     const { minX, maxX, minY, maxY } = rect;
@@ -627,7 +715,6 @@
     out = clipEdge(out, ([_x,y]) => y <= maxY, (A,B) => intersectHorizontal(A,B,maxY));
     if (out.length < 3) return [];
 
-    // remove near-duplicates
     const cleaned = [];
     const eps = 1e-9;
     for (const p of out) {
@@ -642,7 +729,6 @@
     return cleaned;
   }
 
-  // Cohen–Sutherland line clipping to rect
   function clipSegmentToRect(A, B, rect) {
     const { minX, maxX, minY, maxY } = rect;
     const INSIDE = 0, LEFT = 1, RIGHT = 2, BOTTOM = 4, TOP = 8;
@@ -686,7 +772,6 @@
     }
   }
 
-  // Shape with holes
   function ringsToShapeWithHoles(outerClosed, holesClosed) {
     const shape = new THREE.Shape();
     shape.moveTo(outerClosed[0][0], outerClosed[0][1]);
@@ -702,7 +787,6 @@
     return shape;
   }
 
-  // Road width by highway class (meters)
   function roadWidthMeters(tags) {
     const t = (tags && tags.highway) ? String(tags.highway) : "residential";
     const table = {
@@ -761,7 +845,7 @@
     const originLat = (bounds.s + bounds.n) / 2;
     const rect = selectionRectMeters(bounds, originLon, originLat);
 
-    // meters inside Three.js; scale to mm at end
+    // meters in geometry; scale to mm at end
     const baseThicknessM = 0.002;
     const roadsDepthM    = 0.0010;
     const parksDepthM    = 0.0008;
@@ -770,7 +854,7 @@
     const topFeatureM = baseThicknessM + Math.max(roadsDepthM, parksDepthM, waterDepthM);
     const buildingZ0  = topFeatureM;
 
-    // Earcut triangulation hook for ExtrudeGeometry
+    // Earcut triangulation hook
     THREE.ShapeUtils.triangulateShape = (contour, holes) => {
       const vertices = [];
       const holeIndices = [];
@@ -801,17 +885,14 @@
       gBase.add(baseMesh);
     }
 
-    // ---- Polygon feature helper (supports holes via rings[0]=outer, rings[1+]=holes) ----
     function addPolygonFeature(feature, depthM, group, z0M) {
       const ringsLL = feature.rings;
       if (!ringsLL || ringsLL.length === 0) return;
 
-      // project each ring
       const ringsM = ringsLL.map(ringLL =>
         ringLL.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat))
       );
 
-      // prepare open rings for clipping (remove duplicate last point if present)
       const openRingsM = ringsM.map(r => {
         const rr = r.slice();
         if (rr.length >= 2) {
@@ -821,18 +902,15 @@
         return rr;
       });
 
-      // clip outer
       const outerOpen = clipPolygonToRect(openRingsM[0], rect);
       if (outerOpen.length < 3) return;
 
-      // clip holes (keep only those that still exist)
       const holesOpen = [];
       for (let i=1; i<openRingsM.length; i++) {
         const h = clipPolygonToRect(openRingsM[i], rect);
         if (h.length >= 3) holesOpen.push(h);
       }
 
-      // center + close
       const outer = closeRing(outerOpen.map(([x,y]) => [x - rect.cx, y - rect.cy]));
       const holes = holesOpen.map(h => closeRing(h.map(([x,y]) => [x - rect.cx, y - rect.cy])));
 
@@ -845,13 +923,11 @@
       group.add(mesh);
     }
 
-    // Parks
+    // Parks + Water polys
     for (const p of data.parks) addPolygonFeature(p, parksDepthM, gParks, baseThicknessM);
-
-    // Water polygons
     for (const w of data.waterPolys) addPolygonFeature(w, waterDepthM, gWater, baseThicknessM);
 
-    // Roads (as segment quads)
+    // Roads/Waterways as quads
     function addLineAsQuads(linePtsLL, widthM, depthM, group, z0M) {
       const pts = linePtsLL.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
       for (let i=0; i<pts.length-1; i++) {
@@ -879,7 +955,6 @@
 
     // Buildings
     for (const b of data.buildings) {
-      // if relation/way has a height tag, use it; else default
       let hM = parseHeightMeters(b.tags);
       hM = Math.max(3, Math.min(200, hM));
       addPolygonFeature(b, hM, gBuildings, buildingZ0);
@@ -915,14 +990,13 @@
 
       statusEl.textContent = "Exporting STLs… (downloads will start)";
 
-      // Browsers may block multiple downloads—allow if prompted.
       if (fBase.checked)      exportSTLFromGroup(gBase,      "base.stl");
       if (fParks.checked)     exportSTLFromGroup(gParks,     "parks.stl");
       if (fWater.checked)     exportSTLFromGroup(gWater,     "water.stl");
       if (fRoads.checked)     exportSTLFromGroup(gRoads,     "roads.stl");
       if (fBuildings.checked) exportSTLFromGroup(gBuildings, "buildings.stl");
 
-      statusEl.textContent = "Done! Import all STLs together in your slicer and assign colors per object.";
+      statusEl.textContent = "Done! Import all STLs together and color by object.";
     } catch (err) {
       console.error(err);
       statusEl.textContent = `Error: ${err.message}`;
