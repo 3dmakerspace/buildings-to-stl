@@ -68,7 +68,7 @@
         Base thickness: <span class="mono">2 mm</span><br/>
         Default building height: <span class="mono">12 m</span><br/>
         Height from OSM: <span class="mono">height</span> or <span class="mono">building:levels × 3m</span><br/>
-        Auto-fit Z: <span class="mono">OFF</span> (keeps real proportions)
+        Units strategy: <span class="mono">build in meters → scale to mm at export</span>
       </div>
     </div>
 
@@ -222,12 +222,10 @@
       if (w.nodes[0] !== w.nodes[w.nodes.length - 1]) continue;
 
       const ring = w.nodes.map(id => nodes.get(id)).filter(Boolean);
-      if (ring.length >= 4) {
-        polys.push({ rings: [ring], tags: w.tags });
-      }
+      if (ring.length >= 4) polys.push({ rings: [ring], tags: w.tags });
     }
 
-    // Relations/multipolygons not handled yet (next upgrade)
+    // Relations/multipolygons not handled yet
     return polys;
   }
 
@@ -242,7 +240,7 @@
         const val = parseFloat(m[1]);
         if (!Number.isFinite(val)) return DEFAULT_H;
         if (raw.includes("ft") || raw.includes("feet")) return Math.max(3, val * 0.3048);
-        return Math.max(3, val); // meters
+        return Math.max(3, val);
       }
     }
 
@@ -255,24 +253,24 @@
   }
 
   // ------------------ GEOMETRY HELPERS ------------------
-  // IMPORTANT: OUTPUT IS IN MILLIMETERS (mm) so XY and Z are consistent.
-  function projectToLocalMM(lon, lat, originLon, originLat) {
+  // Returns LOCAL METERS (not mm). We scale to mm once at the end.
+  function projectToLocalMeters(lon, lat, originLon, originLat) {
     const R = 6378137;
     const dLon = (lon - originLon) * Math.PI / 180;
     const dLat = (lat - originLat) * Math.PI / 180;
-    const xM = R * dLon * Math.cos(originLat * Math.PI / 180);
-    const yM = R * dLat;
-    return [xM * 1000, yM * 1000]; // mm
+    const x = R * dLon * Math.cos(originLat * Math.PI / 180);
+    const y = R * dLat;
+    return [x, y]; // meters
   }
 
-  function ringsToShape(ringsMM) {
-    const outer = ringsMM[0];
+  function ringsToShape(ringsMeters) {
+    const outer = ringsMeters[0];
     const shape = new THREE.Shape();
     shape.moveTo(outer[0][0], outer[0][1]);
     for (let i=1; i<outer.length; i++) shape.lineTo(outer[i][0], outer[i][1]);
 
-    for (let r=1; r<ringsMM.length; r++) {
-      const holePts = ringsMM[r];
+    for (let r=1; r<ringsMeters.length; r++) {
+      const holePts = ringsMeters[r];
       const hole = new THREE.Path();
       hole.moveTo(holePts[0][0], holePts[0][1]);
       for (let i=1; i<holePts.length; i++) hole.lineTo(holePts[i][0], holePts[i][1]);
@@ -286,79 +284,74 @@
     const originLon = (bounds.w + bounds.e) / 2;
     const originLat = (bounds.s + bounds.n) / 2;
 
-    // STL is unitless; we choose 1 unit = 1 mm
-    const metersToMM = 1000;
-
-    const baseThicknessMM = 2;
-
     const group = new THREE.Group();
 
-    // Base size in mm (local projection already returns mm)
-    const baseWidthMM =
-      Math.abs(projectToLocalMM(bounds.e, originLat, originLon, originLat)[0] -
-               projectToLocalMM(bounds.w, originLat, originLon, originLat)[0]);
+    // Work in METERS inside Three.js, then scale once to mm
+    const baseThicknessM = 0.002; // 2 mm
 
-    const baseHeightMM =
-      Math.abs(projectToLocalMM(originLon, bounds.n, originLon, originLat)[1] -
-               projectToLocalMM(originLon, bounds.s, originLon, originLat)[1]);
+    // Base size in meters
+    const baseWidthM =
+      Math.abs(projectToLocalMeters(bounds.e, originLat, originLon, originLat)[0] -
+               projectToLocalMeters(bounds.w, originLat, originLon, originLat)[0]);
 
-    // Base: thickness in Z (mm)
-    const baseGeom = new THREE.BoxGeometry(baseWidthMM, baseHeightMM, baseThicknessMM);
+    const baseHeightM =
+      Math.abs(projectToLocalMeters(originLon, bounds.n, originLon, originLat)[1] -
+               projectToLocalMeters(originLon, bounds.s, originLon, originLat)[1]);
+
+    // Base box in meters
+    const baseGeom = new THREE.BoxGeometry(baseWidthM, baseHeightM, baseThicknessM);
     const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
-    baseMesh.position.set(0, 0, baseThicknessMM / 2);
+    baseMesh.position.set(0, 0, baseThicknessM / 2);
     group.add(baseMesh);
+
+    // Earcut triangulation hook (needed by ExtrudeGeometry in some cases)
+    THREE.ShapeUtils.triangulateShape = (contour, holes) => {
+      const vertices = [];
+      const holeIndices = [];
+      contour.forEach(p => vertices.push(p.x, p.y));
+      let holeIndex = contour.length;
+      holes.forEach(h => {
+        holeIndices.push(holeIndex);
+        h.forEach(p => vertices.push(p.x, p.y));
+        holeIndex += h.length;
+      });
+      const indices = earcut(vertices, holeIndices, 2);
+      const tris = [];
+      for (let i = 0; i < indices.length; i += 3) tris.push([indices[i], indices[i+1], indices[i+2]]);
+      return tris;
+    };
 
     // Buildings
     for (const b of buildings) {
       let hM = parseHeightMeters(b.tags);
-      hM = Math.max(3, Math.min(80, hM)); // clamp (meters)
-      const hMM = hM * metersToMM;         // mm
+      hM = Math.max(3, Math.min(120, hM)); // clamp meters (allow taller than before)
 
-      const ringsMM = b.rings.map(ring =>
-        ring.map(([lon,lat]) => projectToLocalMM(lon, lat, originLon, originLat))
+      const ringsMeters = b.rings.map(ring =>
+        ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat))
       );
 
       // Close rings
-      for (const ring of ringsMM) {
+      for (const ring of ringsMeters) {
         const first = ring[0];
         const last = ring[ring.length-1];
         if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
       }
 
-      const shape = ringsToShape(ringsMM);
-
-      // Earcut triangulation for Three.js ExtrudeGeometry
-      // NOTE: This overrides triangulateShape globally; ok for this MVP.
-      THREE.ShapeUtils.triangulateShape = (contour, holes) => {
-        const vertices = [];
-        const holeIndices = [];
-        contour.forEach(p => vertices.push(p.x, p.y));
-        let holeIndex = contour.length;
-        holes.forEach(h => {
-          holeIndices.push(holeIndex);
-          h.forEach(p => vertices.push(p.x, p.y));
-          holeIndex += h.length;
-        });
-        const indices = earcut(vertices, holeIndices, 2);
-        const tris = [];
-        for (let i = 0; i < indices.length; i += 3) tris.push([indices[i], indices[i+1], indices[i+2]]);
-        return tris;
-      };
+      const shape = ringsToShape(ringsMeters);
 
       const geom = new THREE.ExtrudeGeometry(shape, {
-        depth: hMM,           // extrudes along +Z in mm
+        depth: hM,            // METERS
         bevelEnabled: false
       });
 
       const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-      mesh.position.z = baseThicknessMM; // sit on base
+      mesh.position.z = baseThicknessM; // sit on base
       group.add(mesh);
     }
 
-    // IMPORTANT: keep real proportions (no Z auto-squash)
-    // autoFitZ(group, 0.35);
+    // FINAL: scale whole thing to millimeters for STL
+    group.scale.set(1000, 1000, 1000);
 
-    // Export STL (binary)
     const exporter = new STLExporter();
     const arrayBuffer = exporter.parse(group, { binary: true });
     return new Blob([arrayBuffer], { type: "application/octet-stream" });
