@@ -68,7 +68,8 @@
         Base thickness: <span class="mono">2 mm</span><br/>
         Default building height: <span class="mono">12 m</span><br/>
         Height from OSM: <span class="mono">height</span> or <span class="mono">building:levels × 3m</span><br/>
-        Units strategy: <span class="mono">build in meters → scale to mm at export</span>
+        Footprints: <span class="mono">clipped to selection</span><br/>
+        Units: <span class="mono">meters → scaled to mm at export</span>
       </div>
     </div>
 
@@ -215,7 +216,6 @@
     }
 
     const polys = [];
-
     for (const w of ways) {
       if (!w.tags || !w.tags.building) continue;
       if (!w.nodes || w.nodes.length < 4) continue;
@@ -225,7 +225,7 @@
       if (ring.length >= 4) polys.push({ rings: [ring], tags: w.tags });
     }
 
-    // Relations/multipolygons not handled yet
+    // Relations/multipolygons not handled yet (next upgrade)
     return polys;
   }
 
@@ -253,7 +253,7 @@
   }
 
   // ------------------ GEOMETRY HELPERS ------------------
-  // Returns LOCAL METERS (not mm). We scale to mm once at the end.
+  // Local meters (equirectangular approximation) around origin
   function projectToLocalMeters(lon, lat, originLon, originLat) {
     const R = 6378137;
     const dLon = (lon - originLon) * Math.PI / 180;
@@ -261,6 +261,108 @@
     const x = R * dLon * Math.cos(originLat * Math.PI / 180);
     const y = R * dLat;
     return [x, y]; // meters
+  }
+
+  function closeRing(points) {
+    if (points.length < 3) return points;
+    const a = points[0], b = points[points.length - 1];
+    if (a[0] !== b[0] || a[1] !== b[1]) points.push([a[0], a[1]]);
+    return points;
+  }
+
+  // Compute selection bbox in local meters from the 4 corners (robust)
+  function selectionRectMeters(bounds, originLon, originLat) {
+    const cornersLL = [
+      [bounds.w, bounds.s],
+      [bounds.e, bounds.s],
+      [bounds.e, bounds.n],
+      [bounds.w, bounds.n]
+    ];
+    const cornersXY = cornersLL.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const [x,y] of cornersXY) {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    return { minX, maxX, minY, maxY, cx, cy, w: (maxX-minX), h: (maxY-minY) };
+  }
+
+  // Sutherland–Hodgman polygon clipping against axis-aligned rectangle
+  // Input: open polygon (no repeated last point) in XY meters
+  function clipPolygonToRect(poly, rect) {
+    // guard
+    if (!poly || poly.length < 3) return [];
+
+    const { minX, maxX, minY, maxY } = rect;
+
+    function clipEdge(points, insideFn, intersectFn) {
+      const out = [];
+      for (let i = 0; i < points.length; i++) {
+        const A = points[i];
+        const B = points[(i + 1) % points.length];
+        const Ain = insideFn(A);
+        const Bin = insideFn(B);
+
+        if (Ain && Bin) {
+          out.push(B);
+        } else if (Ain && !Bin) {
+          out.push(intersectFn(A, B));
+        } else if (!Ain && Bin) {
+          out.push(intersectFn(A, B));
+          out.push(B);
+        }
+      }
+      return out;
+    }
+
+    function intersectVertical(A, B, x) {
+      const [x1,y1] = A, [x2,y2] = B;
+      const t = (x - x1) / (x2 - x1);
+      return [x, y1 + t * (y2 - y1)];
+    }
+
+    function intersectHorizontal(A, B, y) {
+      const [x1,y1] = A, [x2,y2] = B;
+      const t = (y - y1) / (y2 - y1);
+      return [x1 + t * (x2 - x1), y];
+    }
+
+    let out = poly;
+
+    // Left
+    out = clipEdge(out, ([x,_y]) => x >= minX, (A,B) => intersectVertical(A,B,minX));
+    if (out.length < 3) return [];
+
+    // Right
+    out = clipEdge(out, ([x,_y]) => x <= maxX, (A,B) => intersectVertical(A,B,maxX));
+    if (out.length < 3) return [];
+
+    // Bottom
+    out = clipEdge(out, ([_x,y]) => y >= minY, (A,B) => intersectHorizontal(A,B,minY));
+    if (out.length < 3) return [];
+
+    // Top
+    out = clipEdge(out, ([_x,y]) => y <= maxY, (A,B) => intersectHorizontal(A,B,maxY));
+    if (out.length < 3) return [];
+
+    // Remove near-duplicates caused by clipping
+    const cleaned = [];
+    const eps = 1e-9;
+    for (const p of out) {
+      const last = cleaned[cleaned.length - 1];
+      if (!last || Math.abs(p[0]-last[0]) > eps || Math.abs(p[1]-last[1]) > eps) cleaned.push(p);
+    }
+    if (cleaned.length >= 3) {
+      const first = cleaned[0];
+      const last = cleaned[cleaned.length - 1];
+      if (Math.abs(first[0]-last[0]) < eps && Math.abs(first[1]-last[1]) < eps) cleaned.pop();
+    }
+
+    return cleaned;
   }
 
   function ringsToShape(ringsMeters) {
@@ -284,27 +386,20 @@
     const originLon = (bounds.w + bounds.e) / 2;
     const originLat = (bounds.s + bounds.n) / 2;
 
+    const rect = selectionRectMeters(bounds, originLon, originLat);
+
     const group = new THREE.Group();
 
-    // Work in METERS inside Three.js, then scale once to mm
-    const baseThicknessM = 0.002; // 2 mm
+    // meters inside three.js, scale to mm at end
+    const baseThicknessM = 0.002; // 2mm
 
-    // Base size in meters
-    const baseWidthM =
-      Math.abs(projectToLocalMeters(bounds.e, originLat, originLon, originLat)[0] -
-               projectToLocalMeters(bounds.w, originLat, originLon, originLat)[0]);
-
-    const baseHeightM =
-      Math.abs(projectToLocalMeters(originLon, bounds.n, originLon, originLat)[1] -
-               projectToLocalMeters(originLon, bounds.s, originLon, originLat)[1]);
-
-    // Base box in meters
-    const baseGeom = new THREE.BoxGeometry(baseWidthM, baseHeightM, baseThicknessM);
+    // Base sized exactly to selection rectangle in projected meters
+    const baseGeom = new THREE.BoxGeometry(rect.w, rect.h, baseThicknessM);
     const baseMesh = new THREE.Mesh(baseGeom, new THREE.MeshStandardMaterial());
     baseMesh.position.set(0, 0, baseThicknessM / 2);
     group.add(baseMesh);
 
-    // Earcut triangulation hook (needed by ExtrudeGeometry in some cases)
+    // Earcut triangulation hook for ExtrudeGeometry
     THREE.ShapeUtils.triangulateShape = (contour, holes) => {
       const vertices = [];
       const holeIndices = [];
@@ -321,35 +416,48 @@
       return tris;
     };
 
-    // Buildings
+    let kept = 0;
+
     for (const b of buildings) {
       let hM = parseHeightMeters(b.tags);
-      hM = Math.max(3, Math.min(120, hM)); // clamp meters (allow taller than before)
+      hM = Math.max(3, Math.min(120, hM)); // clamp meters
 
-      const ringsMeters = b.rings.map(ring =>
-        ring.map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat))
-      );
+      // Project to meters
+      const ring0 = b.rings[0].map(([lon,lat]) => projectToLocalMeters(lon, lat, originLon, originLat));
 
-      // Close rings
-      for (const ring of ringsMeters) {
-        const first = ring[0];
-        const last = ring[ring.length-1];
-        if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
+      // Remove repeated last point if present (for clipping input)
+      const open = ring0.slice();
+      if (open.length >= 2) {
+        const a = open[0], z = open[open.length - 1];
+        if (a[0] === z[0] && a[1] === z[1]) open.pop();
       }
 
-      const shape = ringsToShape(ringsMeters);
+      // Clip to selection rectangle
+      const clipped = clipPolygonToRect(open, rect);
+      if (clipped.length < 3) continue;
+
+      // Close + center so base and buildings align
+      const centered = closeRing(clipped.map(([x,y]) => [x - rect.cx, y - rect.cy]));
+
+      // Build shape
+      const shape = ringsToShape([centered]);
 
       const geom = new THREE.ExtrudeGeometry(shape, {
-        depth: hM,            // METERS
+        depth: hM,
         bevelEnabled: false
       });
 
       const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial());
-      mesh.position.z = baseThicknessM; // sit on base
+      mesh.position.z = baseThicknessM;
       group.add(mesh);
+      kept++;
     }
 
-    // FINAL: scale whole thing to millimeters for STL
+    if (kept === 0) {
+      console.warn("No buildings survived clipping. Try a denser area.");
+    }
+
+    // scale to millimeters for STL
     group.scale.set(1000, 1000, 1000);
 
     const exporter = new STLExporter();
@@ -379,7 +487,7 @@
       const osm = await fetchBuildingsOSM(currentBounds);
       const buildings = osmToPolygons(osm);
 
-      statusEl.textContent = `Building meshes… (${buildings.length} footprints)`;
+      statusEl.textContent = `Meshing… (${buildings.length} footprints)`;
 
       if (buildings.length === 0) {
         statusEl.textContent = "No buildings found in this area. Try a city block with more structures.";
